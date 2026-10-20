@@ -1,7 +1,9 @@
 import asyncio
 import random
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
 
+from langfuse import Langfuse
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -80,17 +82,21 @@ class OpenRouterChatModel(ChatModel):
         model_id: str,
         api_key: str,
         base_url: str,
+        temperature: float,
         timeout_seconds: int = 120,
         max_tokens: int = 300,
         max_concurrency: int = 1,
         retry_config: RetryConfig | None = None,
+        langfuse: Langfuse | None = None,
     ):
         self.model_id = model_id
+        self.temperature = temperature
         self.max_tokens = max_tokens
 
         self.timeout_seconds = timeout_seconds
         self.max_concurrency = max_concurrency
         self.retry_config = retry_config
+        self.langfuse = langfuse
 
         self._semaphore = asyncio.Semaphore(
             max_concurrency,
@@ -105,20 +111,21 @@ class OpenRouterChatModel(ChatModel):
 
         logger.info(
             "Initialized OpenRouter chat model: "
-            "model=%s | timeout=%ss | "
+            "model=%s | temperature=%s | timeout=%ss | "
             "max_tokens=%s | max_concurrency=%s",
             self.model_id,
+            self.temperature,
             self.timeout_seconds,
             self.max_tokens,
             self.max_concurrency,
         )
 
-    def _record_token_usage(
+    def _extract_token_usage(
         self,
         response,
-    ) -> bool:
+    ) -> dict[str, int] | None:
         """
-        Record token usage returned by OpenRouter.
+        Extract token usage from an OpenRouter response.
         """
 
         usage = getattr(
@@ -128,7 +135,7 @@ class OpenRouterChatModel(ChatModel):
         )
 
         if usage is None:
-            return False
+            return None
 
         input_tokens = getattr(
             usage,
@@ -148,27 +155,54 @@ class OpenRouterChatModel(ChatModel):
             input_tokens + output_tokens,
         )
 
+        return {
+            "input": input_tokens,
+            "output": output_tokens,
+            "total": total_tokens,
+        }
+
+    def _record_token_usage(
+        self,
+        response,
+    ) -> bool:
+        """
+        Record token usage returned by OpenRouter.
+        """
+
+        usage = self._extract_token_usage(
+            response,
+        )
+
+        if usage is None:
+            return False
+
         LLM_INPUT_TOKENS.labels(
             provider="openrouter",
             model=self.model_id,
-        ).inc(input_tokens)
+        ).inc(
+            usage["input"],
+        )
 
         LLM_OUTPUT_TOKENS.labels(
             provider="openrouter",
             model=self.model_id,
-        ).inc(output_tokens)
+        ).inc(
+            usage["output"],
+        )
 
         LLM_TOTAL_TOKENS.labels(
             provider="openrouter",
             model=self.model_id,
-        ).inc(total_tokens)
+        ).inc(
+            usage["total"],
+        )
 
         logger.debug(
             "OpenRouter token usage: model=%s | input=%s | output=%s | total=%s",
             self.model_id,
-            input_tokens,
-            output_tokens,
-            total_tokens,
+            usage["input"],
+            usage["output"],
+            usage["total"],
         )
 
         return True
@@ -178,195 +212,372 @@ class OpenRouterChatModel(ChatModel):
         prompt: str,
         temperature: float,
         max_tokens: int | None,
-    ) -> str:
+        system_prompt: str | None = None,
+    ) -> tuple[str, dict[str, int] | None]:
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
+        messages = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
 
         response = await self.client.chat.completions.create(
             model=self.model_id,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+            messages=messages,
             temperature=temperature,
             max_tokens=effective_max_tokens,
             extra_body={
-                "usage": {
-                    "include": True,
-                },
+                "usage": {"include": True},
+                "reasoning": {"effort": "low"},
             },
+        )
+
+        usage = self._extract_token_usage(
+            response,
         )
 
         self._record_token_usage(
             response,
         )
 
-        content = response.choices[0].message.content
+        if not response.choices:
+            raise RuntimeError("OpenRouter returned no completion choices.")
 
-        return content or ""
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content
+
+        # Support text content returned as either a string or text parts.
+        if isinstance(content, list):
+            content = "".join(
+                part
+                if isinstance(part, str)
+                else (
+                    part.get("text", "")
+                    if isinstance(part, dict)
+                    else getattr(part, "text", "") or ""
+                )
+                for part in content
+            )
+
+        if not isinstance(content, str) or not content.strip():
+            finish_reason = getattr(choice, "finish_reason", None)
+            has_reasoning = bool(
+                getattr(message, "reasoning", None)
+                or getattr(message, "reasoning_details", None)
+            )
+
+            logger.error(
+                "OpenRouter returned empty visible output: "
+                "model=%s | finish_reason=%s | has_reasoning=%s | "
+                "response_id=%s",
+                self.model_id,
+                finish_reason,
+                has_reasoning,
+                getattr(response, "id", None),
+            )
+
+            raise RuntimeError(
+                "OpenRouter returned empty visible output "
+                f"(finish_reason={finish_reason})."
+            )
+
+        return content.strip(), usage
 
     async def generate(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         logger.info(
             "Generating text with OpenRouter model=%s",
             self.model_id,
         )
 
+        effective_temperature = (
+            temperature if temperature is not None else self.temperature
+        )
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
+        trace_active = (
+            self.langfuse is not None
+            and self.langfuse.get_current_trace_id() is not None
+        )
+
+        observation_context = (
+            self.langfuse.start_as_current_observation(
+                as_type="generation",
+                name="llm.generate",
+                model=self.model_id,
+                input={
+                    "prompt_length": len(prompt),
+                },
+                model_parameters={
+                    "temperature": effective_temperature,
+                    "max_tokens": effective_max_tokens,
+                },
+            )
+            if trace_active
+            else nullcontext(None)
+        )
+
         async with self._semaphore:
-            try:
-                if self.retry_config is None:
-                    return await self._generate_once(
-                        prompt=prompt,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
+            with observation_context as generation:
+                try:
+                    if self.retry_config is None:
+                        response_text, usage = await self._generate_once(
+                            prompt=prompt,
+                            temperature=effective_temperature,
+                            max_tokens=max_tokens,
+                            system_prompt=system_prompt,
+                        )
+                    else:
+                        response_text, usage = await retry_async(
+                            lambda: self._generate_once(
+                                prompt=prompt,
+                                temperature=effective_temperature,
+                                max_tokens=max_tokens,
+                                system_prompt=system_prompt,
+                            ),
+                            should_retry=_is_retryable_openrouter_error,
+                            config=self.retry_config,
+                            operation_name=(f"openrouter.chat:{self.model_id}"),
+                        )
+
+                    if generation is not None:
+                        generation.update(
+                            output=response_text,
+                        )
+
+                        if usage is not None:
+                            generation.update(
+                                usage_details=usage,
+                            )
+
+                    return response_text
+
+                except APITimeoutError:
+                    if generation is not None:
+                        generation.update(
+                            level="ERROR",
+                            status_message="APITimeoutError",
+                        )
+
+                    logger.error(
+                        "OpenRouter generation timed out: model=%s",
+                        self.model_id,
                     )
 
-                return await retry_async(
-                    lambda: self._generate_once(
-                        prompt=prompt,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    ),
-                    should_retry=_is_retryable_openrouter_error,
-                    config=self.retry_config,
-                    operation_name=(f"openrouter.chat:{self.model_id}"),
-                )
+                    raise
 
-            except APITimeoutError:
-                logger.error(
-                    "OpenRouter generation timed out: model=%s",
-                    self.model_id,
-                )
-                raise
+                except Exception as exc:
+                    if generation is not None:
+                        generation.update(
+                            level="ERROR",
+                            status_message=type(exc).__name__,
+                        )
 
-            except Exception:
-                logger.exception(
-                    "OpenRouter generation failed: model=%s",
-                    self.model_id,
-                )
-                raise
+                    logger.exception(
+                        "OpenRouter generation failed: model=%s",
+                        self.model_id,
+                    )
+
+                    raise
 
     async def stream(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[str]:
         logger.info(
             "Starting OpenRouter stream: model=%s",
             self.model_id,
         )
 
+        effective_temperature = (
+            temperature if temperature is not None else self.temperature
+        )
+
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
+        messages = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        trace_active = (
+            self.langfuse is not None
+            and self.langfuse.get_current_trace_id() is not None
+        )
+
+        observation_context = (
+            self.langfuse.start_as_current_observation(
+                as_type="generation",
+                name="llm.generate",
+                model=self.model_id,
+                input={
+                    "prompt_length": len(prompt),
+                },
+                model_parameters={
+                    "temperature": effective_temperature,
+                    "max_tokens": effective_max_tokens,
+                },
+            )
+            if trace_active
+            else nullcontext(None)
+        )
 
         async with self._semaphore:
             yielded_content = False
             usage_recorded = False
+            generated_chunks: list[str] = []
+            usage: dict[str, int] | None = None
 
             attempts = (
                 self.retry_config.max_attempts if self.retry_config is not None else 1
             )
 
-            for attempt in range(
-                1,
-                attempts + 1,
-            ):
+            with observation_context as generation:
                 try:
-                    response = await self.client.chat.completions.create(
-                        model=self.model_id,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            }
-                        ],
-                        temperature=temperature,
-                        max_tokens=effective_max_tokens,
-                        stream=True,
-                        extra_body={
-                            "usage": {
-                                "include": True,
-                            },
-                        },
-                    )
-
-                    async for chunk in response:
-                        if chunk.usage is not None:
-                            usage_recorded = self._record_token_usage(
-                                chunk,
+                    for attempt in range(
+                        1,
+                        attempts + 1,
+                    ):
+                        try:
+                            response = await self.client.chat.completions.create(
+                                model=self.model_id,
+                                messages=messages,
+                                temperature=effective_temperature,
+                                max_tokens=effective_max_tokens,
+                                stream=True,
+                                extra_body={
+                                    "usage": {"include": True},
+                                    "reasoning": {"effort": "low"},
+                                },
                             )
-                            continue
 
-                        if not chunk.choices:
-                            continue
+                            async for chunk in response:
+                                if chunk.usage is not None:
+                                    usage = self._extract_token_usage(
+                                        chunk,
+                                    )
 
-                        content = chunk.choices[0].delta.content
+                                    usage_recorded = self._record_token_usage(
+                                        chunk,
+                                    )
+                                    continue
 
-                        if content:
-                            yielded_content = True
-                            yield content
+                                if not chunk.choices:
+                                    continue
 
-                    logger.info(
-                        "OpenRouter stream completed: model=%s",
-                        self.model_id,
-                    )
+                                content = chunk.choices[0].delta.content
 
-                    if not usage_recorded:
-                        logger.debug(
-                            "OpenRouter stream completed without token usage: model=%s",
-                            self.model_id,
+                                if content:
+                                    yielded_content = True
+                                    generated_chunks.append(content)
+                                    yield content
+
+                            logger.info(
+                                "OpenRouter stream completed: model=%s",
+                                self.model_id,
+                            )
+
+                            if generation is not None:
+                                generation.update(
+                                    output="".join(generated_chunks),
+                                )
+
+                                if usage is not None:
+                                    generation.update(
+                                        usage_details=usage,
+                                    )
+
+                            if not usage_recorded:
+                                logger.debug(
+                                    "OpenRouter stream completed without token usage: "
+                                    "model=%s",
+                                    self.model_id,
+                                )
+
+                            return
+
+                        except Exception as exc:
+                            should_stop_retrying = (
+                                yielded_content
+                                or self.retry_config is None
+                                or attempt >= attempts
+                                or not _is_retryable_openrouter_error(exc)
+                            )
+
+                            if should_stop_retrying:
+                                raise
+
+                            delay = _calculate_retry_delay(
+                                retry_config=self.retry_config,
+                                attempt=attempt,
+                            )
+
+                            logger.warning(
+                                "Retrying OpenRouter stream: "
+                                "model=%s | attempt=%s/%s | "
+                                "retry_in=%.2fs",
+                                self.model_id,
+                                attempt,
+                                attempts,
+                                delay,
+                            )
+
+                            await asyncio.sleep(delay)
+
+                except APITimeoutError:
+                    if generation is not None:
+                        generation.update(
+                            output="".join(generated_chunks),
+                            level="ERROR",
+                            status_message="APITimeoutError",
                         )
 
-                    return
+                    logger.error(
+                        "OpenRouter stream timed out: model=%s",
+                        self.model_id,
+                    )
+                    raise
 
                 except Exception as exc:
-                    should_stop_retrying = (
-                        yielded_content
-                        or self.retry_config is None
-                        or attempt >= attempts
-                        or not _is_retryable_openrouter_error(exc)
-                    )
-
-                    if should_stop_retrying:
-                        logger.exception(
-                            "OpenRouter stream failed: model=%s",
-                            self.model_id,
+                    if generation is not None:
+                        generation.update(
+                            output="".join(generated_chunks),
+                            level="ERROR",
+                            status_message=type(exc).__name__,
                         )
-                        raise
 
-                    delay = _calculate_retry_delay(
-                        retry_config=self.retry_config,
-                        attempt=attempt,
-                    )
-
-                    logger.warning(
-                        "Retrying OpenRouter stream: "
-                        "model=%s | attempt=%s/%s | "
-                        "retry_in=%.2fs",
+                    logger.exception(
+                        "OpenRouter stream failed: model=%s",
                         self.model_id,
-                        attempt,
-                        attempts,
-                        delay,
                     )
-
-                    await asyncio.sleep(delay)
+                    raise
 
     async def health_check(self) -> bool:
         try:
-            await self.client.models.retrieve(
-                self.model_id,
+            response = await self.client.get(
+                f"/model/{self.model_id}",
+                cast_to=dict[str, object],
             )
+
+            if not isinstance(response, dict) or not response.get("data"):
+                raise RuntimeError(
+                    "OpenRouter returned an invalid model metadata response."
+                )
 
             logger.info(
                 "OpenRouter chat model is healthy: %s",
                 self.model_id,
             )
-
             return True
 
         except Exception:
@@ -495,6 +706,7 @@ class OpenRouterEmbeddingModel(EmbeddingModel):
                     "OpenRouter embedding timed out: model=%s",
                     self.model_id,
                 )
+
                 raise
 
             except Exception:
@@ -502,6 +714,7 @@ class OpenRouterEmbeddingModel(EmbeddingModel):
                     "OpenRouter embedding failed: model=%s",
                     self.model_id,
                 )
+
                 raise
 
     async def embed_documents(
@@ -538,6 +751,7 @@ class OpenRouterEmbeddingModel(EmbeddingModel):
                     "OpenRouter document embeddings timed out: model=%s",
                     self.model_id,
                 )
+
                 raise
 
             except Exception:
@@ -545,6 +759,7 @@ class OpenRouterEmbeddingModel(EmbeddingModel):
                     "OpenRouter document embeddings failed: model=%s",
                     self.model_id,
                 )
+
                 raise
 
     async def health_check(self) -> bool:
@@ -565,6 +780,7 @@ class OpenRouterEmbeddingModel(EmbeddingModel):
                 "OpenRouter embedding model health check failed: %s",
                 self.model_id,
             )
+
             return False
 
     async def close(self) -> None:

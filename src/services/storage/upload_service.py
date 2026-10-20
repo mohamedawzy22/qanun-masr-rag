@@ -1,6 +1,5 @@
 import os
 
-import aiofiles
 from fastapi import UploadFile
 
 from core.exceptions import BadRequestError
@@ -9,6 +8,7 @@ from models.asset_model import AssetModel
 from models.db_schemes import Asset
 from models.enums.asset_type_enum import AssetTypeEnum
 from models.project_model import ProjectModel
+from services.storage.minio_storage import MinIOStorage
 from services.storage.project_storage import ProjectStorage
 from utils.logger import get_logger
 
@@ -21,6 +21,7 @@ class UploadService:
         project_model: ProjectModel,
         asset_model: AssetModel,
         project_storage: ProjectStorage,
+        minio_storage: MinIOStorage,
         chunk_size: int,
         max_file_size_mb: int,
         allowed_file_types: list[str],
@@ -28,19 +29,18 @@ class UploadService:
         self.project_model = project_model
         self.asset_model = asset_model
         self.project_storage = project_storage
+        self.minio_storage = minio_storage
         self.chunk_size = chunk_size
         self.max_file_size = max_file_size_mb * 1048576
         self.allowed_file_types = set(allowed_file_types)
 
-        logger.info(
-            "Upload service initialized",
-        )
+        logger.info("Upload service initialized with MinIO storage")
 
     def _validate_file(
         self,
         file: UploadFile | None,
-    ) -> None:
-        if file is None:
+    ) -> int:
+        if file is None or not file.filename:
             raise BadRequestError(
                 ResponseSignal.FILE_NOT_FOUND.value,
             )
@@ -50,60 +50,69 @@ class UploadService:
                 ResponseSignal.FILE_TYPE_NOT_SUPPORTED.value,
             )
 
-        if file.size is not None and file.size > self.max_file_size:
+        # Measure the actual received stream instead of trusting the filename.
+        try:
+            file.file.seek(0, os.SEEK_END)
+            file_size = file.file.tell()
+            file.file.seek(0)
+        except (AttributeError, OSError) as exc:
+            logger.warning("Could not determine uploaded file size")
+            raise BadRequestError(
+                ResponseSignal.FILE_UPLOAD_FAILED.value,
+            ) from exc
+
+        if file_size > self.max_file_size:
             raise BadRequestError(
                 ResponseSignal.FILE_SIZE_EXCEEDED.value,
             )
 
-        if not file.filename:
-            raise BadRequestError(
-                ResponseSignal.FILE_NOT_FOUND.value,
-            )
+        return file_size
 
     async def upload(
         self,
         project_id: str,
         file: UploadFile,
     ) -> dict:
-        self._validate_file(file)
+        file_size = self._validate_file(file)
 
         project = await self.project_model.get_project_or_create_one(
             project_id=project_id,
         )
 
-        file_name = self.project_storage.sanitize_file_name(
-            file.filename,
+        sanitized_name = self.project_storage.sanitize_file_name(
+            file.filename or "",
         )
 
-        file_path, generated_file_name = self.project_storage.generate_unique_filepath(
-            project_id=project_id,
-            file_name=file_name,
+        generated_file_name = self.project_storage.generate_unique_file_name(
+            sanitized_name,
         )
+
+        # Use an object key scoped to the project and its assets.
+        object_key = f"projects/{project_id}/assets/{generated_file_name}"
 
         try:
-            async with aiofiles.open(
-                file_path,
-                "wb",
-            ) as output_file:
-                while chunk := await file.read(
-                    self.chunk_size,
-                ):
-                    await output_file.write(chunk)
-
+            await self.minio_storage.upload_file(
+                object_name=object_key,
+                source=file.file,
+                length=file_size,
+                content_type=file.content_type or "application/octet-stream",
+            )
         except Exception as exc:
             logger.exception(
-                "Failed to save uploaded file: project_id=%s | file_id=%s",
+                "Failed to upload object to MinIO: project_id=%s | asset_name=%s",
                 project_id,
                 generated_file_name,
             )
 
+            # Best-effort cleanup if the remote operation partially succeeded.
             try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except OSError:
+                await self.minio_storage.delete_file(
+                    object_name=object_key,
+                )
+            except Exception:
                 logger.exception(
-                    "Failed to remove incomplete uploaded file: path=%s",
-                    file_path,
+                    "Failed to clean up object after upload failure: %s",
+                    object_key,
                 )
 
             raise BadRequestError(
@@ -114,28 +123,35 @@ class UploadService:
             asset_project_id=project.id,
             asset_type=AssetTypeEnum.FILE.value,
             asset_name=generated_file_name,
-            asset_size=os.path.getsize(file_path),
+            asset_size=file_size,
+            asset_config={
+                "storage_provider": "minio",
+                "bucket": self.minio_storage.bucket_name,
+                "object_key": object_key,
+                "content_type": file.content_type,
+                "original_filename": file.filename,
+            },
         )
 
         try:
             asset_record = await self.asset_model.create_asset(
                 asset=asset,
             )
-
         except Exception as exc:
             logger.exception(
-                "Failed to save asset record: project_id=%s | file_id=%s",
+                "Failed to save asset metadata: project_id=%s | asset_name=%s",
                 project_id,
                 generated_file_name,
             )
 
             try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except OSError:
+                await self.minio_storage.delete_file(
+                    object_name=object_key,
+                )
+            except Exception:
                 logger.exception(
-                    "Failed to remove uploaded file after DB failure: path=%s",
-                    file_path,
+                    "Failed to delete MinIO object after MongoDB failure: %s",
+                    object_key,
                 )
 
             raise BadRequestError(
@@ -143,11 +159,14 @@ class UploadService:
             ) from exc
 
         logger.info(
-            "File uploaded successfully: project_id=%s | file_id=%s",
+            "File uploaded successfully: project_id=%s | asset_name=%s "
+            "| size=%s | storage=minio",
             project_id,
             asset_record.asset_name,
+            file_size,
         )
 
+        # Preserve the existing upload response contract.
         return {
             "signal": ResponseSignal.FILE_UPLOAD_SUCCESS.value,
             "asset_name": asset_record.asset_name,

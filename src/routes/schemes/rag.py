@@ -4,7 +4,10 @@ QUERY_MAX_LENGTH = 4000
 LIMIT_MAX_VALUE = 100
 
 
-class SearchRequest(BaseModel):
+# --------------------------------------------------
+# Shared request schema
+# --------------------------------------------------
+class RAGQueryRequest(BaseModel):
     query: str = Field(
         min_length=1,
         max_length=QUERY_MAX_LENGTH,
@@ -17,9 +20,51 @@ class SearchRequest(BaseModel):
     )
 
 
-class SearchResult(BaseModel):
-    text: str
+class SearchRequest(RAGQueryRequest):
+    pass
+
+
+class GenerateRequest(RAGQueryRequest):
+    user_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+    )
+
+
+# --------------------------------------------------
+# Shared retrieved legal article fields
+# --------------------------------------------------
+class LegalArticleResult(BaseModel):
     score: float
+
+    article_number: int | None = None
+
+    book: str | None = None
+    chapter: str | None = None
+    section: str | None = None
+    topic: str | None = None
+
+    text_ar: str | None = None
+    text_en: str | None = None
+
+    is_repealed: bool | None = None
+
+    source_page: int | None = None
+    citation: str | None = None
+    source_file: str | None = None
+
+
+# --------------------------------------------------
+# Search response
+# --------------------------------------------------
+class SearchResult(LegalArticleResult):
+    """Search result without duplicated combined text."""
 
 
 class SearchResponse(BaseModel):
@@ -27,25 +72,15 @@ class SearchResponse(BaseModel):
     results: list[SearchResult]
 
 
-class GenerateRequest(BaseModel):
-    query: str = Field(
-        min_length=1,
-        max_length=QUERY_MAX_LENGTH,
-    )
-
-    limit: int = Field(
-        default=5,
-        gt=0,
-        le=LIMIT_MAX_VALUE,
-    )
-
-
-class GenerateDocument(BaseModel):
-    text: str
-    score: float
+# --------------------------------------------------
+# Generate response
+# --------------------------------------------------
+class GenerateSource(LegalArticleResult):
+    """Source supporting the generated answer."""
 
 
 class GenerateResponse(BaseModel):
-    query: str
     answer: str
-    documents: list[GenerateDocument]
+    sources: list[GenerateSource] = Field(
+        default_factory=list,
+    )

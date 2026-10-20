@@ -1,3 +1,5 @@
+from langfuse import Langfuse
+
 from helpers.config import (
     ChatModelSettings,
     EmbeddingModelSettings,
@@ -23,8 +25,10 @@ class ModelFactory:
     def __init__(
         self,
         settings: Setting,
+        langfuse: Langfuse,
     ):
         self.settings = settings
+        self.langfuse = langfuse
 
     def create_chat_model(
         self,
@@ -47,11 +51,13 @@ class ModelFactory:
             return OllamaChatModel(
                 model_id=config.model,
                 base_url=llm_config.ollama_base_url,
+                temperature=llm_config.temperature,
                 keep_alive=llm_config.ollama_keep_alive,
                 timeout_seconds=llm_config.request_timeout_seconds,
                 max_tokens=llm_config.max_tokens,
                 max_concurrency=llm_config.chat_max_concurrency,
                 retry_config=self.settings.retry,
+                langfuse=self.langfuse,
             )
 
         if config.provider == "openrouter":
@@ -64,10 +70,12 @@ class ModelFactory:
                 model_id=config.model,
                 api_key=self.settings.OPENROUTER_API_KEY,
                 base_url=llm_config.openrouter_base_url,
+                temperature=llm_config.temperature,
                 timeout_seconds=llm_config.request_timeout_seconds,
                 max_tokens=llm_config.max_tokens,
                 max_concurrency=llm_config.chat_max_concurrency,
                 retry_config=self.settings.retry,
+                langfuse=self.langfuse,
             )
 
         raise ValueError(

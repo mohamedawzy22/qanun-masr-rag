@@ -1,5 +1,8 @@
 import time
 from collections.abc import AsyncIterator
+from contextlib import nullcontext
+
+from langfuse import Langfuse
 
 from utils.logger import get_logger
 
@@ -16,6 +19,7 @@ class FallbackChatModel(ChatModel):
         primary_name: str,
         fallback_name: str,
         cooldown_seconds: int = 60,
+        langfuse: Langfuse | None = None,
     ):
         self.primary = primary
         self.fallback = fallback
@@ -24,22 +28,9 @@ class FallbackChatModel(ChatModel):
         self.fallback_name = fallback_name
 
         self.cooldown_seconds = cooldown_seconds
+        self.langfuse = langfuse
+
         self._primary_failed_at: float | None = None
-
-        logger.info(
-            "Chat fallback configured: primary=%s | fallback=%s | cooldown=%ss",
-            self.primary_name,
-            self.fallback_name,
-            self.cooldown_seconds,
-        )
-
-    def set_primary_unavailable(self) -> None:
-        self._mark_primary_failed()
-
-        logger.warning(
-            "Primary chat model marked unavailable: %s",
-            self.primary_name,
-        )
 
     def _primary_available(self) -> bool:
         if self._primary_failed_at is None:
@@ -48,150 +39,141 @@ class FallbackChatModel(ChatModel):
         elapsed = time.monotonic() - self._primary_failed_at
 
         if elapsed >= self.cooldown_seconds:
+            self._primary_failed_at = None
+
             logger.info(
                 "Primary chat model cooldown expired: %s",
                 self.primary_name,
             )
+
             return True
 
-        logger.debug(
-            "Skipping primary chat model during cooldown: %s",
-            self.primary_name,
-        )
         return False
 
     def _mark_primary_failed(self) -> None:
         self._primary_failed_at = time.monotonic()
 
-    def _mark_primary_success(self) -> None:
-        self._primary_failed_at = None
-
-    async def health_check(self) -> bool:
-        try:
-            primary_healthy = await self.primary.health_check()
-        except Exception:
-            logger.exception(
-                "Primary chat model health check failed: %s",
-                self.primary_name,
-            )
-            primary_healthy = False
-
-        if primary_healthy:
-            logger.info(
-                "Primary chat model is healthy: %s",
-                self.primary_name,
-            )
-            return True
-
         logger.warning(
-            "Primary chat model is unavailable: %s",
+            "Primary chat model marked unavailable: %s | cooldown=%ss",
             self.primary_name,
+            self.cooldown_seconds,
         )
 
-        try:
-            fallback_healthy = await self.fallback.health_check()
-        except Exception:
-            logger.exception(
-                "Fallback chat model health check failed: %s",
-                self.fallback_name,
-            )
-            return False
-
-        if fallback_healthy:
+    def _mark_primary_success(self) -> None:
+        if self._primary_failed_at is not None:
             logger.info(
-                "Fallback chat model is healthy: %s",
-                self.fallback_name,
+                "Primary chat model recovered: %s",
+                self.primary_name,
             )
 
-        return fallback_healthy
+        self._primary_failed_at = None
+
+    def set_primary_unavailable(self) -> None:
+        self._mark_primary_failed()
+
+    def _start_fallback_observation(
+        self,
+        reason: str,
+    ):
+        trace_active = (
+            self.langfuse is not None
+            and self.langfuse.get_current_trace_id() is not None
+        )
+
+        if not trace_active:
+            return nullcontext(None)
+
+        return self.langfuse.start_as_current_observation(
+            as_type="span",
+            name="llm.fallback",
+            input={
+                "primary_model": self.primary_name,
+                "fallback_model": self.fallback_name,
+            },
+            metadata={
+                "reason": reason,
+            },
+        )
 
     async def generate(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> str:
+        fallback_reason: str | None = None
 
         if self._primary_available():
             try:
-                logger.info(
-                    "Using primary chat model: %s",
-                    self.primary_name,
-                )
-
                 response = await self.primary.generate(
                     prompt=prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    system_prompt=system_prompt,
                 )
 
                 self._mark_primary_success()
-
-                logger.debug(
-                    "Primary chat model succeeded: %s",
-                    self.primary_name,
-                )
-
                 return response
 
             except Exception:  # noqa: BLE001
                 self._mark_primary_failed()
-
-                logger.warning(
-                    "Primary chat model failed: %s | fallback=%s",
-                    self.primary_name,
-                    self.fallback_name,
-                )
+                fallback_reason = "primary_error"
 
         else:
-            logger.warning(
-                "Primary chat model is in cooldown: %s | using fallback=%s",
-                self.primary_name,
-                self.fallback_name,
-            )
+            fallback_reason = "primary_cooldown"
 
-        try:
-            logger.info(
-                "Using fallback chat model: %s",
-                self.fallback_name,
-            )
+        with self._start_fallback_observation(
+            reason=fallback_reason,
+        ) as fallback_observation:
+            try:
+                response = await self.fallback.generate(
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt,
+                )
 
-            return await self.fallback.generate(
-                prompt=prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+                if fallback_observation is not None:
+                    fallback_observation.update(
+                        output={
+                            "selected_model": self.fallback_name,
+                            "reason": fallback_reason,
+                        },
+                    )
 
-        except Exception:
-            logger.exception(
-                "Fallback chat model failed: %s",
-                self.fallback_name,
-            )
-            raise
+                return response
+
+            except Exception as exc:
+                if fallback_observation is not None:
+                    fallback_observation.update(
+                        level="ERROR",
+                        status_message=type(exc).__name__,
+                    )
+
+                raise
 
     async def stream(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[str]:
-
-        yielded_content = False
+        fallback_reason: str | None = None
 
         if self._primary_available():
-            try:
-                logger.info(
-                    "Starting stream with primary chat model: %s",
-                    self.primary_name,
-                )
+            yielded_content = False
 
-                async for chunk in self.primary.stream(
+            try:
+                async for content in self.primary.stream(
                     prompt=prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    system_prompt=system_prompt,
                 ):
                     yielded_content = True
-                    yield chunk
+                    yield content
 
                 self._mark_primary_success()
                 return
@@ -200,41 +182,55 @@ class FallbackChatModel(ChatModel):
                 self._mark_primary_failed()
 
                 if yielded_content:
-                    logger.exception(
-                        "Primary stream failed after partial response: %s",
-                        self.primary_name,
-                    )
                     raise
 
-                logger.warning(
-                    "Primary stream failed before response: %s | fallback=%s",
-                    self.primary_name,
-                    self.fallback_name,
-                )
+                fallback_reason = "primary_error"
 
         else:
-            logger.warning(
-                "Primary chat model is in cooldown: %s | using fallback=%s",
-                self.primary_name,
-                self.fallback_name,
-            )
+            fallback_reason = "primary_cooldown"
 
-        try:
-            logger.info(
-                "Starting stream with fallback chat model: %s",
-                self.fallback_name,
-            )
+        with self._start_fallback_observation(
+            reason=fallback_reason,
+        ) as fallback_observation:
+            try:
+                async for content in self.fallback.stream(
+                    prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt,
+                ):
+                    yield content
 
-            async for chunk in self.fallback.stream(
-                prompt=prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            ):
-                yield chunk
+                if fallback_observation is not None:
+                    fallback_observation.update(
+                        output={
+                            "selected_model": self.fallback_name,
+                            "reason": fallback_reason,
+                        },
+                    )
 
-        except Exception:
-            logger.exception(
-                "Fallback chat stream failed: %s",
-                self.fallback_name,
-            )
-            raise
+            except Exception as exc:
+                if fallback_observation is not None:
+                    fallback_observation.update(
+                        level="ERROR",
+                        status_message=type(exc).__name__,
+                    )
+
+                raise
+
+    async def health_check(self) -> bool:
+        primary_healthy = await self.primary.health_check()
+        fallback_healthy = await self.fallback.health_check()
+
+        return primary_healthy or fallback_healthy
+
+    async def warm_up(self) -> None:
+        await self.generate(
+            prompt="Reply with OK",
+            temperature=0.0,
+            max_tokens=2048,
+        )
+
+    async def close(self) -> None:
+        await self.primary.close()
+        await self.fallback.close()

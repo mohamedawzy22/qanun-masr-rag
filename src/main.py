@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
         app.state.model_manager = container.model_manager
         app.state.vector_db_manager = container.vector_db_manager
         app.state.rag_controller = container.rag_controller
+        app.state.langfuse = container.langfuse
 
         yield
 

@@ -175,6 +175,45 @@ class QdrantVectorDB(VectorDB):
                 operation_name="qdrant.delete_collection",
             )
 
+    async def delete_by_project_id(
+        self,
+        project_id: str,
+    ) -> None:
+        """Delete Qdrant points belonging to this project only."""
+        project_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="project_id",
+                    match=MatchValue(value=project_id),
+                ),
+            ],
+        )
+
+        async def delete_points():
+            await self.client.delete(
+                collection_name=self.collection_name,
+                points_selector=models.FilterSelector(
+                    filter=project_filter,
+                ),
+                wait=True,
+            )
+
+        if self.retry_config is None:
+            await delete_points()
+        else:
+            await retry_async(
+                delete_points,
+                should_retry=_is_retryable_qdrant_error,
+                config=self.retry_config,
+                operation_name="qdrant.delete_project_points",
+            )
+
+        logger.info(
+            "Deleted indexed vectors for project: project_id=%s | collection=%s",
+            project_id,
+            self.collection_name,
+        )
+
     async def upsert(
         self,
         vectors: list[dict],
@@ -230,7 +269,24 @@ class QdrantVectorDB(VectorDB):
                 query=vector,
                 query_filter=project_filter,
                 limit=limit,
-                with_payload=["text"],
+                with_payload=[
+                    "chunk_id",
+                    "project_id",
+                    "asset_id",
+                    "text",
+                    "article_number",
+                    "book",
+                    "chapter",
+                    "section",
+                    "topic",
+                    "text_ar",
+                    "text_en",
+                    "is_repealed",
+                    "source_page",
+                    "citation",
+                    "source_file",
+                    "chunk_metadata",
+                ],
                 with_vectors=False,
             )
 

@@ -11,6 +11,13 @@ class VectorDB(ABC):
         pass
 
     @abstractmethod
+    async def delete_by_project_id(
+        self,
+        project_id: str,
+    ) -> None:
+        """Delete indexed vectors belonging to one project."""
+
+    @abstractmethod
     async def upsert(
         self,
         vectors: list[dict],

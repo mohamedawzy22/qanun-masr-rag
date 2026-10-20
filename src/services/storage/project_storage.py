@@ -63,6 +63,15 @@ class ProjectStorage:
 
         return file_name or "uploaded_file"
 
+    def generate_unique_file_name(
+        self,
+        file_name: str,
+    ) -> str:
+        """Generate a unique asset name without creating local directories."""
+        random_key = self._generate_random_string()
+
+        return f"{random_key}_{file_name}"
+
     def generate_unique_filepath(
         self,
         project_id: str,
