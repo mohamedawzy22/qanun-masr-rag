@@ -34,6 +34,7 @@ ProjectId = Annotated[
 @rag_router.post("/index/{project_id}")
 async def index(
     project_id: ProjectId,
+    do_reset: bool = False,
     rag_controller: RAGController = Depends(
         get_rag_controller,
     ),
@@ -45,6 +46,7 @@ async def index(
 
     return await rag_controller.index(
         project_id=project_id,
+        do_reset=do_reset,
     )
 
 
@@ -86,6 +88,8 @@ async def generate(
         project_id=project_id,
         query=generate_request.query,
         limit=generate_request.limit,
+        user_id=generate_request.user_id,
+        session_id=generate_request.session_id,
     )
 
     return GenerateResponse(

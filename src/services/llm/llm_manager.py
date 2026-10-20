@@ -115,7 +115,7 @@ class ModelManager:
         try:
             return await asyncio.wait_for(
                 model.health_check(),
-                timeout=5,
+                timeout=20,
             )
 
         except Exception:
@@ -140,6 +140,7 @@ class ModelManager:
             primary_name=primary_name,
             fallback_name=fallback_name,
             cooldown_seconds=cooldown_seconds,
+            langfuse=self.factory.langfuse,
         )
 
         logger.info(
@@ -163,12 +164,32 @@ class ModelManager:
 
         selected_chat = self.get_selected_chat_model()
         selected_embedding = self.get_selected_embedding_model()
+        langfuse = self.factory.langfuse
 
-        await self._warm_up_model(
-            name="chat",
-            model=selected_chat,
-            timeout_seconds=timeout_seconds,
-        )
+        if langfuse is None:
+            await self._warm_up_model(
+                name="chat",
+                model=selected_chat,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            # Warm-up calls the provider's tracing code, so give it
+            # an active observation instead of querying an empty context.
+            with langfuse.start_as_current_observation(
+                as_type="span",
+                name="model.chat-warmup",
+                input={
+                    "model": self.factory.settings.CHAT_PRIMARY_MODEL,
+                },
+                metadata={
+                    "operation": "startup_warmup",
+                },
+            ):
+                await self._warm_up_model(
+                    name="chat",
+                    model=selected_chat,
+                    timeout_seconds=timeout_seconds,
+                )
 
         await self._warm_up_model(
             name="embedding",

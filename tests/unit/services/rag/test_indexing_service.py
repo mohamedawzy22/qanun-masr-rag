@@ -1,9 +1,24 @@
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from services.rag.indexing_service import IndexingService
+
+
+def make_service(
+    embedding_model,
+    vector_db,
+    project_model,
+    chunk_model,
+    langfuse,
+):
+    service = IndexingService.__new__(IndexingService)
+    service.embedding_model = embedding_model
+    service.vector_db = vector_db
+    service.project_model = project_model
+    service.chunk_model = chunk_model
+    service.langfuse = langfuse
+    return service
 
 
 def test_build_qdrant_point_id_is_deterministic():
@@ -22,52 +37,39 @@ def test_build_qdrant_point_id_changes_for_different_chunks():
 
 
 @pytest.mark.anyio
-async def test_index_embeds_chunks_and_upserts_vectors():
+async def test_index_embeds_chunks_and_upserts_legal_metadata(
+    sample_chunks,
+    langfuse,
+):
     embedding_model = AsyncMock()
     vector_db = AsyncMock()
     project_model = AsyncMock()
     chunk_model = AsyncMock()
 
-    chunks = [
-        SimpleNamespace(
-            id="chunk-1",
-            chunk_text="Lebanon is a country in the Middle East.",
-            chunk_asset_id="asset-1",
-        ),
-        SimpleNamespace(
-            id="chunk-2",
-            chunk_text="Beirut is the capital of Lebanon.",
-            chunk_asset_id="asset-1",
-        ),
-    ]
+    project_model.get_project_or_create_one.return_value = type(
+        "Project",
+        (),
+        {"id": "mongo-project-1"},
+    )()
 
-    project_model.get_project_or_create_one.return_value = SimpleNamespace(
-        id="mongo-project-1"
-    )
-
-    async def chunk_iterator(
-        *,
-        project_id,
-        batch_size,
-    ):
+    async def chunk_iterator(*, project_id, batch_size):
         assert project_id == "mongo-project-1"
         assert batch_size == 2
-
-        yield chunks
+        yield sample_chunks
 
     chunk_model.iter_project_chunks = chunk_iterator
-
     embedding_model.embed_documents.return_value = [
         [0.1, 0.2, 0.3],
         [0.4, 0.5, 0.6],
     ]
 
-    service = IndexingService.__new__(IndexingService)
-
-    service.embedding_model = embedding_model
-    service.vector_db = vector_db
-    service.project_model = project_model
-    service.chunk_model = chunk_model
+    service = make_service(
+        embedding_model,
+        vector_db,
+        project_model,
+        chunk_model,
+        langfuse,
+    )
 
     result = await service.index(
         project_id="project1",
@@ -77,38 +79,94 @@ async def test_index_embeds_chunks_and_upserts_vectors():
     project_model.get_project_or_create_one.assert_awaited_once_with(
         project_id="project1",
     )
-
     embedding_model.embed_documents.assert_awaited_once_with(
-        [
-            chunks[0].chunk_text,
-            chunks[1].chunk_text,
-        ]
+        [chunk.chunk_text for chunk in sample_chunks]
     )
-
     vector_db.upsert.assert_awaited_once()
 
     vectors = vector_db.upsert.await_args.args[0]
-
     assert len(vectors) == 2
 
-    assert vectors[0]["payload"] == {
-        "chunk_id": "chunk-1",
-        "project_id": "project1",
-        "asset_id": "asset-1",
-        "text": chunks[0].chunk_text,
-    }
-
-    assert vectors[1]["payload"] == {
-        "chunk_id": "chunk-2",
-        "project_id": "project1",
-        "asset_id": "asset-1",
-        "text": chunks[1].chunk_text,
-    }
-
+    first_payload = vectors[0]["payload"]
+    assert first_payload["chunk_id"] == "chunk-1"
+    assert first_payload["project_id"] == "project1"
+    assert first_payload["asset_id"] == "asset-1"
+    assert first_payload["article_number"] == 147
+    assert first_payload["text_ar"] == "النص العربي"
+    assert first_payload["text_en"] == "English text"
+    assert first_payload["citation"] == "Egyptian Civil Code, Article 147"
+    assert first_payload["source_file"] == "civil_code.pdf"
     assert vectors[0]["vector"] == [0.1, 0.2, 0.3]
-    assert vectors[1]["vector"] == [0.4, 0.5, 0.6]
 
     assert result["project_id"] == "project1"
     assert result["assets"] == 1
     assert result["chunks"] == 2
-    assert "message" in result
+
+
+@pytest.mark.anyio
+async def test_index_skips_repealed_articles(langfuse):
+    embedding_model = AsyncMock()
+    vector_db = AsyncMock()
+    project_model = AsyncMock()
+    chunk_model = AsyncMock()
+
+    project_model.get_project_or_create_one.return_value = type(
+        "Project",
+        (),
+        {"id": "mongo-project-1"},
+    )()
+
+    repealed_chunk = type(
+        "Chunk",
+        (),
+        {
+            "id": "repealed-54",
+            "chunk_text": "Repealed article",
+            "chunk_asset_id": "asset-1",
+            "is_repealed": True,
+        },
+    )()
+
+    async def chunk_iterator(*, project_id, batch_size):
+        yield [repealed_chunk]
+
+    chunk_model.iter_project_chunks = chunk_iterator
+
+    service = make_service(
+        embedding_model,
+        vector_db,
+        project_model,
+        chunk_model,
+        langfuse,
+    )
+
+    result = await service.index(project_id="project1")
+
+    embedding_model.embed_documents.assert_not_awaited()
+    vector_db.upsert.assert_not_awaited()
+    assert result["chunks"] == 0
+    assert result["assets"] == 0
+
+
+@pytest.mark.anyio
+async def test_index_rejects_invalid_batch_size(langfuse):
+    service = IndexingService.__new__(IndexingService)
+    service.langfuse = langfuse
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        await service.index(
+            project_id="project1",
+            batch_size=0,
+        )
+
+
+@pytest.mark.anyio
+async def test_index_rejects_non_integer_batch_size(langfuse):
+    service = IndexingService.__new__(IndexingService)
+    service.langfuse = langfuse
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        await service.index(
+            project_id="project1",
+            batch_size="invalid",
+        )

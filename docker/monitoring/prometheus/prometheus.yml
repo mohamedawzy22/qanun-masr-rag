@@ -27,7 +27,7 @@ scrape_configs:
   # ----------------------------------------------------------
   # RAG FastAPI application
   # ----------------------------------------------------------
-  - job_name: "rag-system"
+  - job_name: "qanun-masr-rag"
     metrics_path: /metrics/
 
     static_configs:

@@ -6,8 +6,9 @@ class ChatModel(ABC):
     async def generate(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> str:
         pass
 
@@ -15,8 +16,9 @@ class ChatModel(ABC):
     async def stream(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ):
         pass
 

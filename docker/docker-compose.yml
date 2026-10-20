@@ -1,4 +1,8 @@
 services:
+  # ==========================================================
+  # MongoDB
+  # Stores RAG application data and metadata.
+  # ==========================================================
   mongo:
     image: mongo:8
 
@@ -28,6 +32,10 @@ services:
       - backend
 
 
+  # ==========================================================
+  # Qdrant
+  # Stores vector embeddings for RAG retrieval.
+  # ==========================================================
   qdrant:
     image: qdrant/qdrant:v1.13.6
 
@@ -45,6 +53,10 @@ services:
       - monitoring
 
 
+  # ==========================================================
+  # Prometheus
+  # Collects application and infrastructure metrics.
+  # ==========================================================
   prometheus:
     image: prom/prometheus:v3.3.0
 
@@ -62,6 +74,10 @@ services:
       - monitoring
 
 
+  # ==========================================================
+  # Grafana
+  # Visualizes Prometheus metrics.
+  # ==========================================================
   grafana:
     image: grafana/grafana:11.6.0-ubuntu
 
@@ -83,13 +99,239 @@ services:
       - monitoring
 
 
+  # ==========================================================
+  # Langfuse Worker
+  # Processes Langfuse events and background jobs asynchronously.
+  # ==========================================================
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+
+    env_file:
+      - ./env/.env.langfuse-worker
+
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      minio:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+      clickhouse:
+        condition: service_healthy
+
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # Langfuse Web
+  # Provides the Langfuse UI and HTTP API.
+  # ==========================================================
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+
+    env_file:
+      - ./env/.env.langfuse-web
+
+    ports:
+      - "3001:3000"
+
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      minio:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+      clickhouse:
+        condition: service_healthy
+
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # PostgreSQL
+  # Stores Langfuse application state and relational metadata.
+  # ==========================================================
+  postgres:
+    image: docker.io/postgres:17
+
+    env_file:
+      - ./env/.env.langfuse-postgres
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d postgres",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # ClickHouse
+  # Stores high-volume Langfuse observability data.
+  # ==========================================================
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+
+    env_file:
+      - ./env/.env.langfuse-clickhouse
+
+    user: "101:101"
+
+    restart: unless-stopped
+
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # Redis
+  # Used for caching and background job queues.
+  # ==========================================================
+  redis:
+    image: docker.io/redis:7
+
+    env_file:
+      - ./env/.env.langfuse-redis
+
+    command:
+      [
+        "sh",
+        "-c",
+        "redis-server --requirepass \"$${REDIS_AUTH}\" --maxmemory-policy noeviction",
+      ]
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -a \"$${REDIS_AUTH}\" ping",
+        ]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+    volumes:
+      - langfuse_redis_data:/data
+
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # MinIO
+  # Provides S3-compatible object storage for Langfuse.
+  # ==========================================================
+  minio:
+    image: cgr.dev/chainguard/minio
+
+    entrypoint: sh
+
+    command:
+      - -c
+      - >
+        mkdir -p /data/langfuse &&
+        minio server
+        --address ":9000"
+        --console-address ":9001"
+        /data
+
+    env_file:
+      - ./env/.env.langfuse-minio
+
+    restart: unless-stopped
+
+    ports:
+      - "9091:9000"
+      - "127.0.0.1:9092:9001"
+
+    volumes:
+      - langfuse_minio_data:/data
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mc",
+          "ready",
+          "local",
+        ]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+    networks:
+      - backend
+
+# ==========================================================
+# Networks
+# ==========================================================
+
 networks:
   backend:
   monitoring:
 
 
+# ==========================================================
+# Volumes
+# ==========================================================
+
 volumes:
   mongo_data:
+
   qdrant_data:
+
   prometheus_data:
+
   grafana_data:
+
+  langfuse_postgres_data:
+
+  langfuse_clickhouse_data:
+
+  langfuse_clickhouse_logs:
+
+  langfuse_minio_data:
+
+  langfuse_redis_data:

@@ -1,3 +1,4 @@
+from langfuse import Langfuse
 from pymongo import AsyncMongoClient
 
 from controllers.rag_controller import RAGController
@@ -9,8 +10,10 @@ from services.llm.llm_factory import ModelFactory
 from services.llm.llm_manager import ModelManager
 from services.processing.processing_service import ProcessingService
 from services.rag.indexing_service import IndexingService
+from services.rag.online_evaluator import OnlineRAGEvaluator
 from services.rag.rag_service import RAGService
 from services.rag.retrieval_service import RetrievalService
+from services.storage.minio_storage import MinIOStorage
 from services.storage.project_storage import ProjectStorage
 from services.storage.upload_service import UploadService
 from services.vectordb.vectordb_factory import VectorDBFactory
@@ -38,6 +41,7 @@ class ApplicationContainer:
         self.vector_db_manager: VectorDBManager | None = None
 
         self.project_storage: ProjectStorage | None = None
+        self.minio_storage: MinIOStorage | None = None
         self.upload_service: UploadService | None = None
 
         self.retrieval_service: RetrievalService | None = None
@@ -47,12 +51,19 @@ class ApplicationContainer:
         self.rag_service: RAGService | None = None
         self.rag_controller: RAGController | None = None
 
+        self.langfuse: Langfuse | None = None
+        self.online_evaluator: OnlineRAGEvaluator | None = None
+
     async def initialize(self) -> None:
         logger.info(
             "Initializing application dependencies",
         )
 
         self._initialize_storage()
+        if self.minio_storage is None:
+            raise RuntimeError("MinIO storage is not initialized")
+        await self.minio_storage.initialize()
+        self._initialize_langfuse()
 
         await self._initialize_mongodb()
         await self._initialize_models()
@@ -61,7 +72,7 @@ class ApplicationContainer:
 
         self._initialize_upload()
         self._initialize_processing()
-        self._initialize_rag()
+        await self._initialize_rag()
 
         logger.info(
             "Application dependencies initialized",
@@ -69,6 +80,13 @@ class ApplicationContainer:
 
     def _initialize_storage(self) -> None:
         self.project_storage = ProjectStorage()
+        self.minio_storage = MinIOStorage(
+            endpoint=self.settings.MINIO_ENDPOINT,
+            access_key=self.settings.MINIO_ACCESS_KEY,
+            secret_key=self.settings.MINIO_SECRET_KEY,
+            bucket_name=self.settings.MINIO_BUCKET_NAME,
+            secure=self.settings.MINIO_SECURE,
+        )
 
         logger.info(
             "Project storage initialized",
@@ -100,8 +118,15 @@ class ApplicationContainer:
         )
 
     async def _initialize_models(self) -> None:
+
+        if self.langfuse is None:
+            raise RuntimeError(
+                "Langfuse is not initialized",
+            )
+
         model_factory = ModelFactory(
             self.settings,
+            langfuse=self.langfuse,
         )
 
         self.model_manager = ModelManager(
@@ -186,10 +211,14 @@ class ApplicationContainer:
                 "Project storage is not initialized",
             )
 
+        if self.minio_storage is None:
+            raise RuntimeError("MinIO storage is not initialized")
+
         self.upload_service = UploadService(
             project_model=self.project_model,
             asset_model=self.asset_model,
             project_storage=self.project_storage,
+            minio_storage=self.minio_storage,
             chunk_size=self.settings.files.default_chunk_size,
             max_file_size_mb=self.settings.files.max_size_mb,
             allowed_file_types=self.settings.files.allowed_types,
@@ -220,18 +249,22 @@ class ApplicationContainer:
                 "Project storage is not initialized",
             )
 
+        if self.minio_storage is None:
+            raise RuntimeError("MinIO storage is not initialized")
+
         self.processing_service = ProcessingService(
             project_model=self.project_model,
             asset_model=self.asset_model,
             chunk_model=self.chunk_model,
             project_storage=self.project_storage,
+            minio_storage=self.minio_storage,
         )
 
         logger.info(
             "Processing service initialized",
         )
 
-    def _initialize_rag(self) -> None:
+    async def _initialize_rag(self) -> None:
         if self.model_manager is None:
             raise RuntimeError(
                 "Model manager is not initialized",
@@ -252,6 +285,11 @@ class ApplicationContainer:
                 "Chunk model is not initialized",
             )
 
+        if self.langfuse is None:
+            raise RuntimeError(
+                "Langfuse is not initialized",
+            )
+
         embedding_model = self.model_manager.get_selected_embedding_model()
 
         chat_model = self.model_manager.get_selected_chat_model()
@@ -263,6 +301,7 @@ class ApplicationContainer:
         self.retrieval_service = RetrievalService(
             embedding_model=embedding_model,
             vector_db=vector_db,
+            langfuse=self.langfuse,
         )
 
         self.indexing_service = IndexingService(
@@ -270,12 +309,24 @@ class ApplicationContainer:
             vector_db=vector_db,
             project_model=self.project_model,
             chunk_model=self.chunk_model,
+            langfuse=self.langfuse,
+        )
+
+        # Online evaluation is required for generated RAG answers.
+        if not self.settings.OLLAMA_BASE_URL:
+            raise RuntimeError("OLLAMA_BASE_URL is required for online RAG evaluation")
+
+        self.online_evaluator = OnlineRAGEvaluator(
+            ollama_base_url=self.settings.OLLAMA_BASE_URL,
+            timeout_seconds=self.settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
         self.rag_service = RAGService(
             chat_model=chat_model,
             retrieval_service=self.retrieval_service,
             indexing_service=self.indexing_service,
+            langfuse=self.langfuse,
+            online_evaluator=self.online_evaluator,
         )
 
         self.rag_controller = RAGController(
@@ -291,8 +342,14 @@ class ApplicationContainer:
             "Closing application dependencies",
         )
 
+        if self.rag_service is not None:
+            await self.rag_service.close()
+
         if self.vector_db_manager is not None:
             await self.vector_db_manager.close()
+
+        if self.online_evaluator is not None:
+            await self.online_evaluator.close()
 
         if self.model_manager is not None:
             await self.model_manager.close()
@@ -300,6 +357,33 @@ class ApplicationContainer:
         if self.mongo_conn is not None:
             await self.mongo_conn.close()
 
+        if self.langfuse is not None:
+            self.langfuse.shutdown()
+
         logger.info(
             "Application dependencies closed",
+        )
+
+    def _initialize_langfuse(self) -> None:
+        public_key = self.settings.LANGFUSE_PUBLIC_KEY
+        secret_key = self.settings.LANGFUSE_SECRET_KEY
+
+        if not public_key or not secret_key:
+            raise RuntimeError(
+                "LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY are required "
+                "for online evaluation and score tracking"
+            )
+
+        self.langfuse = Langfuse(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=self.settings.LANGFUSE_BASE_URL,
+            environment=self.settings.LANGFUSE_TRACING_ENVIRONMENT,
+            release=self.settings.APP_VERSION,
+            tracing_enabled=True,
+        )
+
+        logger.info(
+            "Langfuse initialized: tracing=enabled | environment=%s",
+            self.settings.LANGFUSE_TRACING_ENVIRONMENT,
         )
