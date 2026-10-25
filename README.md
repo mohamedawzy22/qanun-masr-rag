@@ -361,29 +361,67 @@ The exact filenames in the checked-out repository take precedence over this over
 
 ## Docker Setup
 
-For Docker Compose commands, the isolated Ragas evaluation container, and optional DVC setup with MinIO, see the [Docker README](docker/README.md).
+The project uses Docker Compose to run the RAG API and its supporting infrastructure. A `Makefile` in the project root provides convenient commands for managing the stack.
+
+### Available Commands
+
+| Command | Description |
+|---|---|
+| `make help` | Display available commands |
+| `make config` | Validate Docker Compose configuration |
+| `make build` | Build the RAG API image |
+| `make up` | Build and start the stack in the background |
+| `make start` | Start services without forcing a rebuild |
+| `make status` | Show container status |
+| `make health` | Check the RAG API health endpoint |
+| `make logs` | Follow logs from all services |
+| `make logs-api` | Follow RAG API logs |
+| `make stop` | Stop services while preserving containers |
+| `make down` | Remove containers and networks without deleting named volumes |
+
+### Start the Application
+
+Run from the project root:
+
+```bash
+make up
+```
+
+Verify the services and API:
+
+```bash
+make status
+make health
+```
+
+Follow API logs:
+
+```bash
+make logs-api
+```
+
+### Local Service URLs
+
+- RAG API: http://localhost:8001
+- Swagger UI: http://localhost:8001/docs
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000
+- Langfuse: http://localhost:3001
+
+See [Docker README](docker/README.md) for additional infrastructure details.
 
 ---
-
 ## Prerequisites
 
-- Python 3.11 or newer.
-- `uv` for Python dependency management.
-- MongoDB.
-- Qdrant.
+- Docker Desktop with Docker Compose support, or Docker Engine with the Compose plugin.
+- A configured root `.env` file.
+- A configured `docker/env/.env.app` file for RAG API settings.
 - Ollama when using local inference.
 - An OpenRouter API key when using OpenRouter models.
 
-Make sure the required databases and model providers are reachable from the URLs configured in the application.
-
-For Ollama, verify the installed models using:
-
-```bash
-ollama list
-```
+Ensure the configured model providers are reachable from the Docker environment. Do not commit credentials or other secrets to Git.
 
 ---
-
 ## Installation & Setup
 
 ### 1. Enter the Project Directory
@@ -392,52 +430,64 @@ ollama list
 cd ~/projects/OrangeHub/qanun-masr-rag
 ```
 
-### 2. Install Dependencies
+### 2. Configure Environment Variables
+
+Configure the root `.env` file and `docker/env/.env.app`. Keep credentials and other secrets out of version control.
+
+### 3. Review Available Commands
 
 ```bash
-uv sync
+make help
 ```
 
-### 3. Configure Environment Variables
-
-Create or update the `.env` file in the project root with the settings required by the application's Pydantic configuration.
-
-Do not commit API keys, passwords, or other secrets to Git.
-
-### 4. Start Infrastructure
-
-Start MongoDB and Qdrant, and ensure the configured chat and embedding providers are available.
-
-Verify that Ollama is reachable when using local models:
+### 4. Validate the Configuration
 
 ```bash
-ollama list
+make config
 ```
 
-### 5. Run the API
-
-From the project root:
+### 5. Build and Start the Application
 
 ```bash
-PYTHONPATH=src uv run uvicorn main:app --host 0.0.0.0 --port 8001
+make up
 ```
 
-Local API address:
+This validates the Compose configuration, builds the RAG API image, and starts the configured services in the background.
 
-```text
-http://localhost:8001
+### 6. Verify the Application
+
+```bash
+make status
+make health
 ```
 
-Swagger UI:
+Open Swagger UI at http://localhost:8001/docs.
 
-```text
-http://localhost:8001/docs
+### 7. Troubleshoot Startup Issues
+
+```bash
+make logs-api
 ```
 
-Use Swagger UI to inspect the request and response schemas exposed by the running application.
+To follow logs from all services:
+
+```bash
+make logs
+```
+
+Stop services while preserving their containers:
+
+```bash
+make stop
+```
+
+Remove containers and networks while preserving named volumes:
+
+```bash
+make down
+```
 
 ---
-
 ## Environment Variables
 
 The following table summarizes the main configuration settings. The actual required fields and defaults are defined in the application's settings classes.
@@ -475,12 +525,10 @@ The configured vector dimension must match the output dimension of the selected 
 ### Health Check
 
 ```bash
-curl http://localhost:8001/api/v1/health
+curl -fsS http://localhost:8001/api/v1/health
 ```
 
 ### Upload a Document
-
-The upload endpoint accepts a file within a project scope:
 
 ```bash
 curl -X POST \
@@ -489,7 +537,7 @@ curl -X POST \
   -F "file=@./document.pdf"
 ```
 
-Replace `./document.pdf` with the path to the source PDF and `1` with the intended project identifier.
+Replace `./document.pdf` with the source PDF path and `1` with the intended project identifier.
 
 ### Process Uploaded Documents
 
@@ -499,7 +547,7 @@ The processing endpoint runs the processing service for the selected project:
 POST /api/v1/data/process/{project_id}
 ```
 
-The processing request schema is exposed in Swagger UI. Use it to inspect the currently supported request fields and processing options.
+Use Swagger UI to inspect the supported request fields and processing options.
 
 ### Index Legal Articles
 
@@ -517,25 +565,23 @@ RAG operations are exposed under:
 /api/v1/rag
 ```
 
-Use Swagger UI to inspect the exact routes, request bodies, and response schemas for retrieval and answer generation.
+Use Swagger UI to inspect the exact routes, request bodies, and response schemas.
 
 ---
-
 ## Typical Workflow
 
-1. Start MongoDB, Qdrant, and the configured model providers.
-2. Start the FastAPI application.
+1. Configure the environment variables and ensure the model providers are reachable.
+2. Start the stack using `make up`, then verify it with `make status` and `make health`.
 3. Upload the source PDF to the intended project.
 4. Run document processing to extract and store the legal articles.
-5. Review known extraction limitations and check relevant records against the source.
+5. Review extraction limitations and verify relevant records against the source.
 6. Index the stored article records in Qdrant.
 7. Submit legal questions through the RAG API.
-8. Review the retrieved sources and verify relevant provisions against the source PDF and authoritative legal material.
+8. Review retrieved sources and verify relevant provisions against the source PDF and authoritative legal material.
 
-The quality of generated answers depends on the extraction accuracy, embedding model, retrieved context, and selected chat model.
+The quality of generated answers depends on extraction accuracy, the embedding model, retrieved context, and the selected chat model.
 
 ---
-
 ## Testing
 
 The following commands are available for running the project's tests when validation is scheduled.

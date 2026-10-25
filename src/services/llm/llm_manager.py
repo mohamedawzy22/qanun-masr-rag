@@ -48,6 +48,7 @@ class ModelManager:
         )
 
     async def health_check_models(self) -> None:
+        """Check the primary model first and inspect fallback only when needed."""
         logger.info("Checking model health...")
 
         primary_name = self.factory.settings.CHAT_PRIMARY_MODEL
@@ -55,7 +56,6 @@ class ModelManager:
         embedding_name = self.factory.settings.EMBEDDING_MODEL
 
         primary_model = self.get_chat_model(primary_name)
-        fallback_model = self.get_chat_model(fallback_name)
         embedding_model = self.get_embedding_model(embedding_name)
 
         primary_healthy = await self._check_model(
@@ -63,35 +63,45 @@ class ModelManager:
             model=primary_model,
         )
 
-        fallback_healthy = await self._check_model(
-            name=fallback_name,
-            model=fallback_model,
-        )
+        # Do not contact the fallback provider during startup when
+        # the primary chat model is healthy.
+        if not primary_healthy:
+            logger.warning(
+                "Primary chat model is unavailable; checking fallback: %s",
+                fallback_name,
+            )
+
+            fallback_model = self.get_chat_model(fallback_name)
+
+            fallback_healthy = await self._check_model(
+                name=fallback_name,
+                model=fallback_model,
+            )
+
+            if not fallback_healthy:
+                logger.error(
+                    "Fallback chat model is unavailable: %s",
+                    fallback_name,
+                )
+                raise RuntimeError(
+                    f"Fallback chat model '{fallback_name}' is unavailable"
+                )
 
         embedding_healthy = await self._check_model(
             name=embedding_name,
             model=embedding_model,
         )
 
-        if not fallback_healthy:
-            logger.error(
-                "Fallback chat model is unavailable: %s",
-                fallback_name,
-            )
-
-            raise RuntimeError(f"Fallback chat model '{fallback_name}' is unavailable")
-
         if not embedding_healthy:
             logger.error(
                 "Embedding model is unavailable: %s",
                 embedding_name,
             )
-
             raise RuntimeError(f"Embedding model '{embedding_name}' is unavailable")
 
         if not primary_healthy:
             logger.warning(
-                "Primary chat model is unavailable. Starting with fallback: %s",
+                "Starting with fallback because primary is unavailable: %s",
                 fallback_name,
             )
 
@@ -99,6 +109,12 @@ class ModelManager:
 
             if isinstance(selected_chat_model, FallbackChatModel):
                 selected_chat_model.set_primary_unavailable()
+
+        else:
+            logger.info(
+                "Primary model is healthy; fallback health check deferred: %s",
+                fallback_name,
+            )
 
         logger.info("Model health check completed successfully")
 

@@ -327,6 +327,9 @@ class ApplicationContainer:
             indexing_service=self.indexing_service,
             langfuse=self.langfuse,
             online_evaluator=self.online_evaluator,
+            evaluation_interval_seconds=(
+                self.settings.ONLINE_EVALUATION_INTERVAL_SECONDS
+            ),
         )
 
         self.rag_controller = RAGController(

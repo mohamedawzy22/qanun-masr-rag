@@ -1,7 +1,7 @@
 from functools import cached_property
 from pathlib import Path
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from services.vectordb.vector_db_enum import DistanceMetric
@@ -85,6 +85,11 @@ class Setting(BaseSettings):
     APP_NAME: str
     APP_VERSION: str
     LOG_LEVEL: str = "INFO"
+
+    # -------------------------
+    # Online evaluation
+    # -------------------------
+    ONLINE_EVALUATION_INTERVAL_SECONDS: int = Field(default=300, ge=1)
 
     # -------------------------
     # Model runtime

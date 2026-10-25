@@ -435,7 +435,11 @@ class DocumentProcessor:
         page_lines.sort(
             key=lambda item: (
                 round(item["bbox"][1], 1),
-                item["bbox"][0],
+                (
+                    -item["bbox"][2]
+                    if cls._script_side(item["text"]) == "ar"
+                    else item["bbox"][0]
+                ),
             )
         )
 
@@ -526,7 +530,11 @@ class DocumentProcessor:
                         cell_lines.sort(
                             key=lambda item: (
                                 round(item["bbox"][1], 1),
-                                item["bbox"][0],
+                                (
+                                    -item["bbox"][2]
+                                    if cls._script_side(item["text"]) == "ar"
+                                    else item["bbox"][0]
+                                ),
                             )
                         )
 
@@ -1151,6 +1159,51 @@ class DocumentProcessor:
                 f"Check PDF extraction: {preview}"
             )
 
+    @staticmethod
+    def _remove_arabic_paragraph_numbering(
+        articles: list[dict],
+    ) -> list[dict]:
+        """Remove Arabic subparagraph markers without changing article references."""
+        import re
+
+        marker_patterns = [
+            re.compile(r"(?<!\w)\(\s*[0-9٠-٩۰-۹]{1,2}\s*\)(?!\w)"),
+            re.compile(r"(?<!\w)\)\s*[0-9٠-٩۰-۹]{1,2}\s*\((?!\w)"),
+            re.compile(r"(?<!\S)[0-9٠-٩۰-۹]{1,2}\s*\(\s*(?=\S)"),
+        ]
+
+        reference_context = re.compile(
+            r"(?:المادة|مادة|المواد|المادتان|المادتين|"
+            r"البند|الفقرة|فقرة)\s*"
+            r"(?:رقم\s*)?"
+            r"(?:[0-9٠-٩۰-۹]+\s*)?$"
+        )
+
+        for article in articles:
+            text = article.get("text_ar")
+
+            if not isinstance(text, str) or not text:
+                continue
+
+            for pattern in marker_patterns:
+                original_text = text
+
+                def replace_marker(match, source_text=original_text):
+                    prefix = source_text[max(0, match.start() - 60) : match.start()]
+
+                    # Preserve legal references such as "المادة (2)".
+                    if reference_context.search(prefix):
+                        return match.group(0)
+
+                    return " "
+
+                text = pattern.sub(replace_marker, text)
+
+            # Join line-wrapped Arabic text into one continuous paragraph.
+            article["text_ar"] = " ".join(text.split())
+
+        return articles
+
     def extract_legal_articles(self, file_path: str | Path) -> list[dict]:
         """Extract bilingual article records directly from the supplied PDF."""
         path = Path(file_path)
@@ -1178,6 +1231,7 @@ class DocumentProcessor:
         )
 
         articles = self._parse_article_rows(rows)
+        articles = self._remove_arabic_paragraph_numbering(articles)
         articles = self._insert_repealed_articles(articles)
         self._validate_articles(articles)
         chunks = self._split_long_articles(articles)

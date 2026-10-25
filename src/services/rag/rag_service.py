@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from dataclasses import dataclass
 
 from langfuse import Langfuse, propagate_attributes
 
@@ -27,6 +28,15 @@ from utils.metrics import (
 logger = get_logger(__name__)
 
 
+@dataclass(slots=True)
+class EvaluationJob:
+    trace_id: str
+    project_id: str
+    query: str
+    answer: str
+    results: list[dict]
+
+
 class RAGService:
     def __init__(
         self,
@@ -35,13 +45,17 @@ class RAGService:
         indexing_service: IndexingService,
         langfuse: Langfuse,
         online_evaluator: OnlineRAGEvaluator | None = None,
+        evaluation_interval_seconds: int = 300,
     ):
         self.chat_model = chat_model
         self.retrieval_service = retrieval_service
         self.indexing_service = indexing_service
         self.langfuse = langfuse
         self.online_evaluator = online_evaluator
-        self._evaluation_tasks: set[asyncio.Task[None]] = set()
+        self.evaluation_interval_seconds = max(1, int(evaluation_interval_seconds))
+        self._pending_evaluations: list[EvaluationJob] = []
+        self._evaluation_worker_task: asyncio.Task[None] | None = None
+        self._evaluation_stop_event = asyncio.Event()
 
         logger.info(
             "RAG service initialized successfully",
@@ -220,11 +234,11 @@ class RAGService:
         answer: str,
         results: list[dict],
     ) -> None:
-        """Schedule evaluation without delaying the API response."""
+        """Queue an evaluation without delaying the API response."""
 
         if self.online_evaluator is None:
             logger.error(
-                "Cannot schedule evaluation: evaluator is unavailable | project_id=%s",
+                "Cannot queue evaluation: evaluator is unavailable | project_id=%s",
                 project_id,
             )
             return
@@ -233,53 +247,103 @@ class RAGService:
 
         if not trace_id:
             logger.error(
-                "Cannot schedule evaluation without an active trace | project_id=%s",
+                "Cannot queue evaluation without an active trace | project_id=%s",
                 project_id,
             )
             return
 
-        task = asyncio.create_task(
-            self._evaluate_and_score(
+        self._pending_evaluations.append(
+            EvaluationJob(
                 trace_id=trace_id,
                 project_id=project_id,
                 query=query,
                 answer=answer,
                 results=results,
-            ),
-            name=f"rag-evaluation:{project_id}:{trace_id}",
+            )
         )
 
-        self._evaluation_tasks.add(task)
-        task.add_done_callback(self._on_evaluation_done)
+        if self._evaluation_worker_task is None or self._evaluation_worker_task.done():
+            self._evaluation_stop_event.clear()
+            self._evaluation_worker_task = asyncio.create_task(
+                self._run_evaluation_worker(),
+                name="rag-online-evaluation-worker",
+            )
 
         logger.debug(
-            "Online evaluation scheduled: project_id=%s | trace_id=%s",
+            "Online evaluation queued: project_id=%s | trace_id=%s | pending=%s",
             project_id,
             trace_id,
+            len(self._pending_evaluations),
         )
 
-    def _on_evaluation_done(
-        self,
-        task: asyncio.Task[None],
-    ) -> None:
-        """Release completed tasks and report unexpected task failures."""
+    async def _run_evaluation_worker(self) -> None:
+        """Evaluate queued answers periodically in the background."""
 
-        self._evaluation_tasks.discard(task)
+        logger.info(
+            "Periodic online evaluation worker started: interval_seconds=%s",
+            self.evaluation_interval_seconds,
+        )
 
-        if task.cancelled():
-            return
+        try:
+            while True:
+                # Wait for the next scheduled batch, unless shutdown was requested.
+                if not self._evaluation_stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            self._evaluation_stop_event.wait(),
+                            timeout=self.evaluation_interval_seconds,
+                        )
+                    except TimeoutError:
+                        pass
 
-        exception = task.exception()
+                batch = self._pending_evaluations
+                self._pending_evaluations = []
 
-        if exception is not None:
-            logger.error(
-                "Unexpected online evaluation task failure",
-                exc_info=(
-                    type(exception),
-                    exception,
-                    exception.__traceback__,
-                ),
-            )
+                if batch:
+                    logger.info(
+                        "Starting online evaluation batch: count=%s",
+                        len(batch),
+                    )
+
+                    for job in batch:
+                        try:
+                            await self._evaluate_and_score(
+                                trace_id=job.trace_id,
+                                project_id=job.project_id,
+                                query=job.query,
+                                answer=job.answer,
+                                results=job.results,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Unexpected evaluation batch item failure: "
+                                "project_id=%s | trace_id=%s",
+                                job.project_id,
+                                job.trace_id,
+                            )
+
+                    logger.info(
+                        "Online evaluation batch completed: count=%s",
+                        len(batch),
+                    )
+
+                # During shutdown, keep draining jobs that arrived while a batch ran.
+                if (
+                    self._evaluation_stop_event.is_set()
+                    and not self._pending_evaluations
+                ):
+                    break
+
+        except asyncio.CancelledError:
+            logger.warning("Periodic online evaluation worker cancelled")
+            raise
+        except Exception:
+            logger.exception("Periodic online evaluation worker failed")
+        finally:
+            if self._evaluation_worker_task is asyncio.current_task():
+                self._evaluation_worker_task = None
 
     async def _evaluate_and_score(
         self,
@@ -479,18 +543,11 @@ class RAGService:
                 # --------------------------------------------
                 # Retrieve relevant legal articles
                 # --------------------------------------------
-                # Let the prompt choose relevant evidence from a wider pool.
-                retrieval_limit = min(max(limit * 3, 15), 30)
+                # Use vector-search results directly. Avoid an extra LLM
+                # call for evidence selection before answer generation.
                 results = await self.retrieval_service.search(
                     project_id=project_id,
                     query=query,
-                    limit=retrieval_limit,
-                )
-
-                # Select relevant evidence before answer generation.
-                results = await self._select_relevant_results(
-                    query=query,
-                    results=results,
                     limit=limit,
                 )
 
@@ -667,42 +724,42 @@ class RAGService:
         self,
         timeout_seconds: float = 30.0,
     ) -> None:
-        """Drain evaluation tasks before closing their dependencies."""
+        """Drain pending evaluations before closing their dependencies."""
 
-        tasks = tuple(self._evaluation_tasks)
+        task = self._evaluation_worker_task
 
-        if not tasks:
+        if task is None:
             return
 
         logger.info(
-            "Waiting for pending online evaluations: count=%s",
-            len(tasks),
+            "Stopping online evaluation worker: pending=%s",
+            len(self._pending_evaluations),
         )
 
-        done, pending = await asyncio.wait(
-            tasks,
+        # Wake the worker so it can flush queued evaluations without waiting
+        # for the full periodic interval.
+        self._evaluation_stop_event.set()
+
+        _, pending_tasks = await asyncio.wait(
+            {task},
             timeout=timeout_seconds,
         )
 
-        if pending:
+        if pending_tasks:
             logger.warning(
-                "Cancelling unfinished online evaluations during shutdown: count=%s",
-                len(pending),
+                "Online evaluation worker exceeded shutdown timeout; cancelling it"
+            )
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        if self._pending_evaluations:
+            logger.warning(
+                "Some evaluations did not finish during shutdown: pending=%s",
+                len(self._pending_evaluations),
             )
 
-            for task in pending:
-                task.cancel()
-
-            await asyncio.gather(
-                *pending,
-                return_exceptions=True,
-            )
-
-        logger.info(
-            "Online evaluation shutdown complete: finished=%s | cancelled=%s",
-            len(done),
-            len(pending),
-        )
+        if self._evaluation_worker_task is task:
+            self._evaluation_worker_task = None
 
     async def _select_relevant_results(
         self,

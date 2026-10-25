@@ -138,28 +138,12 @@ class IndexingService:
                     project_id=project.id,
                     batch_size=batch_size,
                 ):
-                    # Keep repealed article records in MongoDB, but do not
-                    # embed metadata-only repeal markers into the vector index.
-                    searchable_chunks = [
-                        chunk
-                        for chunk in chunks
-                        if not getattr(chunk, "is_repealed", False)
-                    ]
-
-                    skipped_repealed = len(chunks) - len(searchable_chunks)
-
-                    if skipped_repealed:
-                        logger.info(
-                            "Excluded repealed articles from vector indexing: "
-                            "project_id=%s | count=%s",
-                            project_id,
-                            skipped_repealed,
-                        )
-
-                    if not searchable_chunks:
+                    # Index all legal article records, including repealed
+                    # articles, so their status and citations are represented
+                    # in the Qdrant payload.
+                    if not chunks:
                         continue
 
-                    chunks = searchable_chunks
                     total_batches += 1
 
                     with self.langfuse.start_as_current_observation(

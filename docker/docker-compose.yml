@@ -7,7 +7,7 @@ services:
     image: mongo:8
 
     ports:
-      - "27007:27017"
+      - "127.0.0.1:27007:27017"
 
     volumes:
       - mongo_data:/data/db
@@ -40,8 +40,8 @@ services:
     image: qdrant/qdrant:v1.13.6
 
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
 
     volumes:
       - qdrant_data:/qdrant/storage
@@ -61,7 +61,7 @@ services:
     image: prom/prometheus:v3.3.0
 
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
 
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -82,7 +82,7 @@ services:
     image: grafana/grafana:11.6.0-ubuntu
 
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
     env_file:
       - ./env/.env.grafana
@@ -124,6 +124,23 @@ services:
       clickhouse:
         condition: service_healthy
 
+    environment:
+      HOSTNAME: "0.0.0.0"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:3030/api/health",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     networks:
       - backend
 
@@ -139,7 +156,7 @@ services:
       - ./env/.env.langfuse-web
 
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
 
     restart: unless-stopped
 
@@ -156,6 +173,23 @@ services:
       clickhouse:
         condition: service_healthy
 
+    environment:
+      HOSTNAME: "0.0.0.0"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:3000/api/public/health?failIfDatabaseUnavailable=true",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     networks:
       - backend
 
@@ -282,7 +316,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "9091:9000"
+      - "127.0.0.1:9091:9000"
       - "127.0.0.1:9092:9001"
 
     volumes:
@@ -304,9 +338,201 @@ services:
     networks:
       - backend
 
+  # ==========================================================
+  # Qdrant readiness gate
+  # The Qdrant image does not need an extra curl installation.
+  # This short-lived Python container polls Qdrant's health endpoint.
+  # ==========================================================
+  qdrant-ready:
+    image: python:3.11-slim-bookworm
+    command:
+      - python
+      - -c
+      - |
+        import sys
+        import time
+        from urllib.request import urlopen
+
+        url = "http://qdrant:6333/readyz"
+        deadline = time.monotonic() + 180
+
+        while time.monotonic() < deadline:
+            try:
+                with urlopen(url, timeout=3) as response:
+                    if response.status == 200:
+                        print("Qdrant is ready.", flush=True)
+                        sys.exit(0)
+            except Exception:
+                pass
+            time.sleep(2)
+
+        print("Qdrant did not become ready within 180 seconds.", flush=True)
+        sys.exit(1)
+    depends_on:
+      qdrant:
+        condition: service_started
+    restart: "no"
+    read_only: true
+    user: "10001:10001"
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # Ollama readiness gate
+  # Docker Desktop exposes the host as host.docker.internal.
+  # OLLAMA_BASE_URL_DOCKER is the native Ollama URL, without /v1.
+  # ==========================================================
+  ollama-ready:
+    image: python:3.11-slim-bookworm
+    environment:
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+      PYTHONDONTWRITEBYTECODE: "1"
+    command:
+      - python
+      - -c
+      - |
+        import os
+        import sys
+        import time
+        from urllib.request import urlopen
+
+        base = os.environ["OLLAMA_BASE_URL"].rstrip("/")
+        url = base + "/api/tags"
+        deadline = time.monotonic() + 180
+
+        while time.monotonic() < deadline:
+            try:
+                with urlopen(url, timeout=3) as response:
+                    if response.status == 200:
+                        print("Ollama API is ready.", flush=True)
+                        sys.exit(0)
+            except Exception:
+                pass
+            time.sleep(2)
+
+        print("Ollama did not become reachable within 180 seconds.", flush=True)
+        sys.exit(1)
+    restart: "no"
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      - backend
+
+
+  # ==========================================================
+  # Egyptian Civil Code RAG API
+  # ==========================================================
+  rag-api:
+    image: qanun-masr-rag-api:local
+
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+
+    env_file:
+      - ./env/.env.app
+    environment:
+      MONGODB_URL: ${MONGODB_URL_DOCKER:?MONGODB_URL_DOCKER must be set in the project .env}
+      QDRANT_URL: "http://qdrant:6333"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_SECURE: "false"
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL_DOCKER:-http://langfuse-web:3000}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+
+    ports:
+      - "127.0.0.1:8001:8001"
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+      qdrant-ready:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      langfuse-web:
+        condition: service_healthy
+      langfuse-worker:
+        condition: service_healthy
+      ollama-ready:
+        condition: service_completed_successfully
+
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/v1/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+    networks:
+      - backend
+
+
 # ==========================================================
 # Networks
 # ==========================================================
+
+  # ==========================================================
+  # Optional Locust load testing
+  # Start explicitly with: make load-test
+  # ==========================================================
+  locust:
+    image: locustio/locust:2.46.7
+    profiles:
+      - loadtest
+    command:
+      - -f
+      - /mnt/locust/locustfile.py
+      - --web-host
+      - 0.0.0.0
+      - --web-port
+      - "8089"
+      - --host
+      - http://rag-api:8001
+    environment:
+      LOCUST_PROJECT_ID: "${LOCUST_PROJECT_ID:-1}"
+    volumes:
+      - ./loadtest/locustfile.py:/mnt/locust/locustfile.py:ro
+    ports:
+      - "127.0.0.1:8089:8089"
+    depends_on:
+      rag-api:
+        condition: service_healthy
+    restart: "no"
+    init: true
+    networks:
+      - backend
 
 networks:
   backend:
