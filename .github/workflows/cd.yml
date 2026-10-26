@@ -1,4 +1,4 @@
-name: CD - Build, Smoke Test, and Publish Docker Image
+name: CD - Build, Stage, and Publish Candidate
 
 on:
   push:
@@ -13,18 +13,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ==========================================================
-  # JOB 1: Build the Docker image without publishing it.
-  # ==========================================================
   build_image:
-    name: 1. Build Docker Image
+    name: 1. Build Candidate Image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     outputs:
       image_name: ${{ steps.image.outputs.name }}
 
     steps:
-      - name: Checkout the commit pushed to main
+      - name: Checkout exact commit
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -38,7 +36,7 @@ jobs:
         run: |
           echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/qanun-masr-rag-api" >> "$GITHUB_OUTPUT"
 
-      - name: Build image locally without publishing
+      - name: Build image without publishing
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -49,13 +47,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Export the image for downstream jobs
-        shell: bash
+      - name: Export image for downstream jobs
         env:
           IMAGE: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
         run: docker save --output image.tar "$IMAGE"
 
-      - name: Upload built image artifact
+      - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: rag-api-image-${{ github.sha }}
@@ -64,199 +61,150 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  # ==========================================================
-  # JOB 2: Run the actual container and verify its health.
-  # This job starts only after the image build has succeeded.
-  # ==========================================================
   smoke_test:
-    name: 2. Smoke Test Container
+    name: 2. Fast Container Smoke Test
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: build_image
 
     steps:
-      - name: Download the built image
+      - name: Download built image
         uses: actions/download-artifact@v4
         with:
           name: rag-api-image-${{ github.sha }}
           path: ./image-artifact
 
-      - name: Load the built image
+      - name: Load built image
         run: docker load --input ./image-artifact/image.tar
 
-      - name: Set up Python for environment parsing
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dotenv parser
-        run: python -m pip install --disable-pip-version-check --no-input python-dotenv
-
-      - name: Smoke-test the built API image
-        shell: bash
+      - name: Test container and health endpoint
         env:
-          ENV_APP: ${{ secrets.ENV_APP }}
           IMAGE: ${{ needs.build_image.outputs.image_name }}:sha-${{ github.sha }}
+        shell: bash
         run: |
-          set -euo pipefail
-
-          if [[ -z "${ENV_APP:-}" ]]; then
-            echo "::error::Repository secret ENV_APP is missing."
-            exit 1
-          fi
-
+          set -Eeuo pipefail
           smoke_dir="$(mktemp -d)"
-          chmod 700 "$smoke_dir"
-
-          env_file="$smoke_dir/app.env"
+          env_file="$smoke_dir/smoke.env"
           health_file="$smoke_dir/health.json"
-          container_name="rag-api-smoke-${GITHUB_RUN_ID}"
+          container_name="rag-smoke-${GITHUB_RUN_ID}"
+          umask 077
 
           cleanup() {
+            local exit_code=$?
+            trap - EXIT
             docker rm -f "$container_name" >/dev/null 2>&1 || true
             rm -rf "$smoke_dir"
+            exit "$exit_code"
           }
           trap cleanup EXIT
 
-          umask 077
-          printf '%s\n' "$ENV_APP" > "$env_file"
-          unset ENV_APP
+          # No production secrets or external services are used in this fast test.
+          cat > "$env_file" <<'ENV'
+          APP_NAME=rag-system
+          APP_VERSION=smoke-test
+          LOG_LEVEL=INFO
+          FILE_ALLOWED_TYPES=["application/pdf","text/plain"]
+          FILE_MAX_SIZE=10
+          FILE_DEFAULT_CHUNK_SIZE=512
+          MINIO_ACCESS_KEY=smoke-access
+          MINIO_SECRET_KEY=smoke-secret
+          MONGODB_URL=mongodb://localhost:27017
+          MONGODB_DATABASE=smoke_test
+          CHAT_MODELS={"smoke-primary":{"provider":"ollama","model":"unused"},"smoke-fallback":{"provider":"ollama","model":"unused"}}
+          CHAT_PRIMARY_MODEL=smoke-primary
+          CHAT_FALLBACK_MODEL=smoke-fallback
+          EMBEDDING_MODELS={"smoke-embedding":{"provider":"ollama","model":"unused","dimension":384}}
+          EMBEDDING_MODEL=smoke-embedding
+          QDRANT_URL=http://localhost:6333
+          QDRANT_COLLECTION_NAME=smoke-test
+          QDRANT_VECTOR_SIZE=384
+          QDRANT_DISTANCE=cosine
+          ENV
 
-          export SMOKE_ENV_FILE="$env_file"
-          export SMOKE_CONTAINER_NAME="$container_name"
-
-          # Parse the environment file with python-dotenv.
-          # Pass variable names to Docker, while their values stay out
-          # of command-line arguments.
-          python - <<'PY'
-          import os
-          import re
-          import subprocess
-          from dotenv import dotenv_values
-
-          values = dotenv_values(
-              os.environ["SMOKE_ENV_FILE"],
-              interpolate=False,
-          )
-
-          env_values = {}
-
-          for key, value in values.items():
-              if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                  raise SystemExit(
-                      "Invalid environment variable name in ENV_APP."
-                  )
-
-              if value is None:
-                  raise SystemExit(
-                      f"Environment variable {key} has no value."
-                  )
-
-              env_values[key] = value
-
-          if not env_values:
-              raise SystemExit(
-                  "ENV_APP contains no usable environment variables."
-              )
-
-          docker_env = os.environ.copy()
-          docker_env.pop("SMOKE_ENV_FILE", None)
-          docker_env.pop("SMOKE_CONTAINER_NAME", None)
-
-          for key, value in env_values.items():
-              docker_env[key] = value
-
-          command = [
-              "docker",
-              "run",
-              "--detach",
-              "--name",
-              os.environ["SMOKE_CONTAINER_NAME"],
-              "--publish",
-              "127.0.0.1:18001:8001",
-          ]
-
-          for key in env_values:
-              command.extend(["--env", key])
-
-          command.extend(
-              [
-                  os.environ["IMAGE"],
-                  "uvicorn",
-                  "main:app",
-                  "--app-dir",
-                  "/app/src",
-                  "--host",
-                  "0.0.0.0",
-                  "--port",
-                  "8001",
-                  "--lifespan",
-                  "off",
-              ]
-          )
-
-          subprocess.run(
-              command,
-              check=True,
-              env=docker_env,
-              stdout=subprocess.DEVNULL,
-          )
-
-          print("Smoke-test container started.")
-          PY
+          docker run --detach \
+            --name "$container_name" \
+            --publish 127.0.0.1:18001:8001 \
+            --env-file "$env_file" \
+            "$IMAGE" \
+            uvicorn main:app \
+              --app-dir /app/src \
+              --host 0.0.0.0 \
+              --port 8001 \
+              --lifespan off >/dev/null
 
           healthy=0
-
           for ((attempt = 1; attempt <= 30; attempt++)); do
-            if curl --fail --silent --show-error --max-time 3 \
+            if curl --fail --silent --max-time 3 \
               http://127.0.0.1:18001/api/v1/health \
-              --output "$health_file" 2>/dev/null; then
-
-              if python -c \
-                'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p.get("API_Name") == "rag-system" and p.get("API_Version") else 1)' \
-                "$health_file"; then
+              --output "$health_file"; then
+              if python3 -c '
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as file:
+              payload = json.load(file)
+          sys.exit(0 if payload.get("API_Name") == "rag-system" and payload.get("API_Version") == "smoke-test" else 1)
+          ' "$health_file"; then
                 healthy=1
                 break
               fi
             fi
-
             sleep 2
           done
 
           if [[ "$healthy" -ne 1 ]]; then
-            echo "::error::Smoke test failed: /api/v1/health did not return the expected API payload."
-
-            docker inspect "$container_name" \
-              --format 'Container status: {{.State.Status}}' || true
-
-            docker logs --tail=80 "$container_name" || true
+            echo "::error::Fast smoke test failed."
+            docker logs --tail=100 "$container_name" || true
             exit 1
           fi
 
-          echo "Smoke test passed: API name and version verified."
+          echo "Fast smoke test passed."
 
-  # ==========================================================
-  # JOB 3: Publish the exact image that passed the smoke test.
-  # This job cannot start unless build_image and smoke_test pass.
-  # ==========================================================
-  publish:
-    name: 3. Publish Verified Image to GHCR
+  staging_integration:
+    name: 3. Ephemeral Staging Integration Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: build_image
+
+    steps:
+      - name: Checkout integration test script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Download built image
+        uses: actions/download-artifact@v4
+        with:
+          name: rag-api-image-${{ github.sha }}
+          path: ./image-artifact
+
+      - name: Load built image
+        run: docker load --input ./image-artifact/image.tar
+
+      - name: Run full-startup integration test
+        env:
+          IMAGE: ${{ needs.build_image.outputs.image_name }}:sha-${{ github.sha }}
+        run: bash .github/scripts/integration-test.sh
+
+  publish_candidate:
+    name: 4. Publish Tested Candidate to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs:
       - build_image
       - smoke_test
+      - staging_integration
 
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Download the smoke-tested image
+      - name: Download tested image
         uses: actions/download-artifact@v4
         with:
           name: rag-api-image-${{ github.sha }}
           path: ./image-artifact
 
-      - name: Load the smoke-tested image
+      - name: Load tested image
         run: docker load --input ./image-artifact/image.tar
 
       - name: Normalize image name
@@ -265,28 +213,30 @@ jobs:
         run: |
           echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/qanun-masr-rag-api" >> "$GITHUB_OUTPUT"
 
-      - name: Tag the exact tested image
-        env:
-          IMAGE: ${{ steps.image.outputs.name }}
-          COMMIT_SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker tag "${IMAGE}:sha-${COMMIT_SHA}" "${IMAGE}:latest"
-
-      - name: Log in to GitHub Container Registry
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish the smoke-tested image
+      - name: Publish immutable candidate tags only
         env:
           IMAGE: ${{ steps.image.outputs.name }}
           COMMIT_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          short_sha="${COMMIT_SHA:0:7}"
+          docker tag "${IMAGE}:sha-${COMMIT_SHA}" "${IMAGE}:candidate-${short_sha}"
           docker push "${IMAGE}:sha-${COMMIT_SHA}"
-          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:candidate-${short_sha}"
+          {
+            echo "## Staging candidate is ready"
+            echo
+            echo "- Commit: \`${COMMIT_SHA}\`"
+            echo "- Immutable image: \`${IMAGE}:sha-${COMMIT_SHA}\`"
+            echo "- Candidate tag: \`${IMAGE}:candidate-${short_sha}\`"
+            echo
+            echo "No production \`latest\` tag was changed. Review this run, then manually start the Promote Tested Image workflow to promote this SHA."
+          } >> "$GITHUB_STEP_SUMMARY"

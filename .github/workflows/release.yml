@@ -1,0 +1,111 @@
+name: Promote Tested Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_sha:
+        description: "Full 40-character commit SHA from a successful staging candidate run"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: production-image-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote Candidate to latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: Validate requested candidate SHA
+        env:
+          IMAGE_SHA: ${{ inputs.image_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::image_sha must be a full, lowercase 40-character commit SHA."
+            exit 1
+          fi
+          echo "Validated image SHA: $IMAGE_SHA"
+
+      - name: Verify successful staging candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_SHA: ${{ inputs.image_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Run image promotion from main."
+            exit 1
+          fi
+
+          response="$(curl --fail --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/cd.yml/runs?head_sha=${IMAGE_SHA}&status=completed&per_page=100")"
+
+          if ! jq -e --arg sha "$IMAGE_SHA" '
+            any(
+              .workflow_runs[]?;
+              .head_sha == $sha
+              and .name == "CD - Build, Stage, and Publish Candidate"
+              and .event == "push"
+              and .head_branch == "main"
+              and .status == "completed"
+              and .conclusion == "success"
+            )
+          ' <<< "$response" >/dev/null; then
+            echo "::error::No successful staging candidate run found for this SHA."
+            exit 1
+          fi
+
+          echo "Verified: this SHA passed the staging candidate workflow."
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/qanun-masr-rag-api" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the exact tested candidate
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          IMAGE_SHA: ${{ inputs.image_sha }}
+        run: docker pull "${IMAGE}:sha-${IMAGE_SHA}"
+
+      - name: Promote candidate to latest
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          IMAGE_SHA: ${{ inputs.image_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE}:sha-${IMAGE_SHA}" "${IMAGE}:latest"
+          docker push "${IMAGE}:latest"
+          {
+            echo "## Image promoted in GHCR"
+            echo
+            echo "- Source: \`${IMAGE}:sha-${IMAGE_SHA}\`"
+            echo "- Promoted tag: \`${IMAGE}:latest\`"
+            echo
+            echo "This workflow promotes the image tag in GHCR. It does not deploy to a running server or update a production host."
+          } >> "$GITHUB_STEP_SUMMARY"
