@@ -64,21 +64,42 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Create environment file
-        env:
-          ENV_APP: ${{ secrets.ENV_APP }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${ENV_APP:-}" ]]; then
-            echo "::error::Repository secret ENV_APP is missing."
-            exit 1
-          fi
-          umask 077
-          printf '%s\n' "$ENV_APP" > .env
-          unset ENV_APP
-
       - name: Run tests
+        env:
+          APP_NAME: qanun-masr-rag-ci
+          APP_VERSION: "0.0.0-ci"
+          LOG_LEVEL: ERROR
+
+          FILE_ALLOWED_TYPES: '["application/pdf","text/plain"]'
+          FILE_MAX_SIZE: "10"
+          FILE_DEFAULT_CHUNK_SIZE: "512"
+
+          MINIO_ENDPOINT: "127.0.0.1:9091"
+          MINIO_ACCESS_KEY: ci-test-access-key
+          MINIO_SECRET_KEY: ci-test-secret-key
+
+          MONGODB_URL: "mongodb://127.0.0.1:27017"
+          MONGODB_DATABASE: qanun_masr_ci
+
+          OPENROUTER_API_KEY: ""
+          OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1"
+          OLLAMA_BASE_URL: "http://127.0.0.1:11434/v1"
+
+          CHAT_MODELS: '{"ci-primary":{"provider":"ollama","model":"qwen2.5:0.5b"},"ci-fallback":{"provider":"ollama","model":"qwen2.5:0.5b"}}'
+          CHAT_PRIMARY_MODEL: ci-primary
+          CHAT_FALLBACK_MODEL: ci-fallback
+          EMBEDDING_MODELS: '{"ci-embedding":{"provider":"ollama","model":"all-minilm:33m","dimension":384}}'
+          EMBEDDING_MODEL: ci-embedding
+
+          QDRANT_URL: "http://127.0.0.1:6333"
+          QDRANT_API_KEY: ""
+          QDRANT_COLLECTION_NAME: qanun_masr_ci
+          QDRANT_VECTOR_SIZE: "384"
+          QDRANT_DISTANCE: cosine
+
+          LANGFUSE_PUBLIC_KEY: ""
+          LANGFUSE_SECRET_KEY: ""
+          LANGFUSE_BASE_URL: "http://127.0.0.1:3000"
         run: uv run pytest
 
   docker_build:
