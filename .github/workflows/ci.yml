@@ -1,13 +1,15 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - "**"
-
   pull_request:
     branches:
       - main
+
+  # Optional: allow manually running CI from GitHub Actions.
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   quality:
@@ -55,11 +57,15 @@ jobs:
         env:
           ENV_APP: ${{ secrets.ENV_APP }}
         run: |
-          test -n "$ENV_APP" || (echo "ENV_APP secret is missing" && exit 1)
+          test -n "$ENV_APP" || {
+            echo "ENV_APP secret is missing"
+            exit 1
+          }
           printf '%s\n' "$ENV_APP" > .env
 
       - name: Run tests
         run: uv run pytest
+
   docker-build:
     name: Validate Docker Image Build
     runs-on: ubuntu-latest
