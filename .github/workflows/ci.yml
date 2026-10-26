@@ -4,12 +4,20 @@ on:
   pull_request:
     branches:
       - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
 
-  # Optional: allow manually running CI from GitHub Actions.
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality:
@@ -31,12 +39,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Run pre-commit
+      - name: Run pre-commit checks (tests run in the next job)
+        env:
+          SKIP: pytest
         run: uv run pre-commit run --all-files
 
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    needs: quality
 
     steps:
       - name: Checkout repository
@@ -56,19 +67,24 @@ jobs:
       - name: Create environment file
         env:
           ENV_APP: ${{ secrets.ENV_APP }}
+        shell: bash
         run: |
-          test -n "$ENV_APP" || {
-            echo "ENV_APP secret is missing"
+          set -euo pipefail
+          if [[ -z "${ENV_APP:-}" ]]; then
+            echo "::error::Repository secret ENV_APP is missing."
             exit 1
-          }
+          fi
+          umask 077
           printf '%s\n' "$ENV_APP" > .env
+          unset ENV_APP
 
       - name: Run tests
         run: uv run pytest
 
-  docker-build:
+  docker_build:
     name: Validate Docker Image Build
     runs-on: ubuntu-latest
+    needs: tests
 
     steps:
       - name: Checkout repository
