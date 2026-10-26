@@ -17,25 +17,20 @@ dependencies = [
     "python-multipart>=0.0.32",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.0.0,<2.0.0",
-
     # LangChain 0.3-compatible stack
     "langchain-community>=0.3.0,<0.4.0",
     "langchain-core>=0.3.78,<0.4.0",
     "langchain-text-splitters>=0.3.0,<0.4.0",
-
     # OpenAI SDK compatible with the selected LangChain integration
     "openai>=2.0.0,<3.0.0",
-
     # LLM observability
     "langfuse>=4.17.0,<5.0.0",
     "ollama>=0.6.2,<1.0.0",
-
     # Storage and vector database
     "minio>=7.2.20",
     "pymongo>=4.18.1",
     "qdrant-client==1.14.1",
     "pymupdf>=1.28.2",
-
     # Monitoring
     "prometheus-client>=0.26.0",
     "ragas==0.4.3",

@@ -44,7 +44,7 @@ async def test_generate_uses_retrieved_legal_documents_and_returns_sources(
     retrieval_service.search.assert_awaited_once_with(
         project_id="project1",
         query="Explain contract formation and good faith.",
-        limit=15,
+        limit=2,
     )
     chat_model.generate.assert_awaited_once()
 
@@ -170,8 +170,6 @@ async def test_evidence_selection_falls_back_to_top_result_on_invalid_json(
 
     assert selected == [sample_documents[0]]
 
-
-# Additional coverage: prompt construction and online evaluation
 
 # Additional coverage: prompt construction and online evaluation
 
@@ -399,7 +397,8 @@ async def test_generate_propagates_retrieval_errors(langfuse):
 async def test_close_returns_when_no_evaluation_tasks_are_pending(langfuse):
     service = RAGService.__new__(RAGService)
     service.langfuse = langfuse
-    service._evaluation_tasks = set()
+    service._evaluation_worker_task = None
+    service._pending_evaluations = []
 
     await service.close(timeout_seconds=0.1)
 
@@ -423,4 +422,119 @@ def test_rag_service_constructor_initializes_dependencies(langfuse):
     assert service.indexing_service is indexing_service
     assert service.langfuse is langfuse
     assert service.online_evaluator is online_evaluator
-    assert service._evaluation_tasks == set()
+    assert service._pending_evaluations == []
+    assert service._evaluation_worker_task is None
+    assert service.evaluation_interval_seconds == 300
+
+
+@pytest.mark.anyio
+async def test_evaluate_and_score_records_partial_status_when_metric_is_missing(
+    sample_documents,
+    langfuse,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    service = RAGService.__new__(RAGService)
+    service.langfuse = langfuse
+    service.online_evaluator = SimpleNamespace(
+        judge_model="qwen2.5:3b",
+        embedding_model="bge-m3:latest",
+        evaluate=AsyncMock(
+            return_value=(
+                {"answer_relevancy": 0.8},
+                {"faithfulness": "Judge unavailable"},
+            )
+        ),
+    )
+    langfuse.create_score = Mock()
+
+    await service._evaluate_and_score(
+        trace_id="trace-partial-metric",
+        project_id="project1",
+        query="What is the legal rule?",
+        answer="The answer.",
+        results=sample_documents,
+    )
+
+    status_call = langfuse.create_score.call_args_list[-1]
+    assert status_call.kwargs["name"] == "online_evaluation_status"
+    assert status_call.kwargs["value"] == "partial"
+    assert status_call.kwargs["metadata"]["missing_required_metrics"] == [
+        "faithfulness"
+    ]
+    assert status_call.kwargs["metadata"]["failed_metrics"] == ["faithfulness"]
+
+
+@pytest.mark.anyio
+async def test_evaluate_and_score_records_partial_status_when_score_write_fails(
+    sample_documents,
+    langfuse,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    service = RAGService.__new__(RAGService)
+    service.langfuse = langfuse
+    service.online_evaluator = SimpleNamespace(
+        judge_model="qwen2.5:3b",
+        embedding_model="bge-m3:latest",
+        evaluate=AsyncMock(
+            return_value=(
+                {
+                    "faithfulness": 0.9,
+                    "answer_relevancy": 0.8,
+                },
+                {},
+            )
+        ),
+    )
+
+    def create_score_side_effect(**kwargs):
+        if kwargs.get("name") == "faithfulness":
+            raise RuntimeError("Langfuse unavailable")
+
+    langfuse.create_score = Mock(side_effect=create_score_side_effect)
+
+    await service._evaluate_and_score(
+        trace_id="trace-score-write-error",
+        project_id="project1",
+        query="What is the legal rule?",
+        answer="The answer.",
+        results=sample_documents,
+    )
+
+    status_call = langfuse.create_score.call_args_list[-1]
+    assert status_call.kwargs["name"] == "online_evaluation_status"
+    assert status_call.kwargs["value"] == "partial"
+    assert status_call.kwargs["metadata"]["score_write_failures"] == ["faithfulness"]
+
+
+@pytest.mark.anyio
+async def test_evaluate_and_score_propagates_cancellation(
+    sample_documents,
+    langfuse,
+):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    service = RAGService.__new__(RAGService)
+    service.langfuse = langfuse
+    service.online_evaluator = SimpleNamespace(
+        judge_model="qwen2.5:3b",
+        embedding_model="bge-m3:latest",
+        evaluate=AsyncMock(side_effect=asyncio.CancelledError()),
+    )
+    langfuse.create_score = Mock()
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._evaluate_and_score(
+            trace_id="trace-cancelled",
+            project_id="project1",
+            query="What is the legal rule?",
+            answer="The answer.",
+            results=sample_documents,
+        )
+
+    langfuse.create_score.assert_not_called()

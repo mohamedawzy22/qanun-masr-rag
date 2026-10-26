@@ -104,8 +104,14 @@ async def test_index_embeds_chunks_and_upserts_legal_metadata(
 
 
 @pytest.mark.anyio
-async def test_index_skips_repealed_articles(langfuse):
+async def test_index_includes_repealed_articles_and_upserts_metadata(
+    langfuse,
+):
     embedding_model = AsyncMock()
+    embedding_model.embed_documents.return_value = [
+        [0.1, 0.2, 0.3],
+    ]
+
     vector_db = AsyncMock()
     project_model = AsyncMock()
     chunk_model = AsyncMock()
@@ -123,7 +129,17 @@ async def test_index_skips_repealed_articles(langfuse):
             "id": "repealed-54",
             "chunk_text": "Repealed article",
             "chunk_asset_id": "asset-1",
+            "chunk_metadata": {"source": "civil_code.pdf"},
+            "article_number": 54,
+            "book": "Book One",
+            "chapter": "Chapter One",
+            "section": "Section One",
+            "topic": "Repealed provisions",
+            "text_ar": "المادة 54 ملغاة",
+            "text_en": "Article 54 repealed",
             "is_repealed": True,
+            "source_page": 4,
+            "citation": "Egyptian Civil Code, Article 54",
         },
     )()
 
@@ -142,10 +158,32 @@ async def test_index_skips_repealed_articles(langfuse):
 
     result = await service.index(project_id="project1")
 
-    embedding_model.embed_documents.assert_not_awaited()
-    vector_db.upsert.assert_not_awaited()
-    assert result["chunks"] == 0
-    assert result["assets"] == 0
+    embedding_model.embed_documents.assert_awaited_once_with(
+        ["Repealed article"],
+    )
+    vector_db.upsert.assert_awaited_once()
+
+    vectors = vector_db.upsert.await_args.args[0]
+    assert len(vectors) == 1
+
+    payload = vectors[0]["payload"]
+
+    assert payload["article_number"] == 54
+    assert payload["book"] == "Book One"
+    assert payload["chapter"] == "Chapter One"
+    assert payload["section"] == "Section One"
+    assert payload["topic"] == "Repealed provisions"
+    assert payload["text_ar"] == "المادة 54 ملغاة"
+    assert payload["text_en"] == "Article 54 repealed"
+    assert payload["is_repealed"] is True
+    assert payload["source_page"] == 4
+    assert payload["citation"] == "Egyptian Civil Code, Article 54"
+
+    assert payload["source_file"] == "civil_code.pdf"
+    assert vectors[0]["vector"] == [0.1, 0.2, 0.3]
+
+    assert result["chunks"] == 1
+    assert result["assets"] == 1
 
 
 @pytest.mark.anyio
