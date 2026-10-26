@@ -59,54 +59,78 @@ jobs:
             exit 1
           fi
 
-          env_file="$(mktemp)"
-          health_file="$(mktemp)"
-          container_name="rag-api-smoke-${GITHUB_RUN_ID}"
+          smoke_dir="$(mktemp -d)"
+          chmod 700 "$smoke_dir"
+
+          env_file="$smoke_dir/app.env"
+          compose_file="$smoke_dir/compose.yaml"
+          health_file="$smoke_dir/health.json"
+          compose_project="rag-smoke-${GITHUB_RUN_ID}"
 
           cleanup() {
-            docker rm -f "$container_name" >/dev/null 2>&1 || true
-            rm -f "$env_file" "$health_file"
+            docker compose \
+              -p "$compose_project" \
+              -f "$compose_file" \
+              down --timeout 1 >/dev/null 2>&1 || true
+
+            rm -rf "$smoke_dir"
           }
           trap cleanup EXIT
-          chmod 600 "$env_file"
+
           printf '%s\n' "$ENV_APP" > "$env_file"
+          chmod 600 "$env_file"
           unset ENV_APP
 
-          docker run --detach \
-            --name "$container_name" \
-            --env-file "$env_file" \
-            --publish 127.0.0.1:18001:8001 \
-            "$IMAGE" >/dev/null
+          cat > "$compose_file" <<EOF
+          services:
+            api:
+              image: "${IMAGE}"
+              env_file:
+                - ./app.env
+              ports:
+                - "127.0.0.1:18001:8001"
+          EOF
+
+          docker compose \
+            -p "$compose_project" \
+            -f "$compose_file" \
+            up -d --no-build
 
           healthy=0
+
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error --max-time 3 \
               http://127.0.0.1:18001/api/v1/health \
               --output "$health_file" 2>/dev/null; then
-              if python - "$health_file" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
 
-          payload = json.loads(Path(sys.argv[1]).read_text())
-          if payload.get("API_Name") != "rag-system" or not payload.get("API_Version"):
-              raise SystemExit(1)
-          PY
-              then
+              if python -c \
+                'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(0 if p.get("API_Name") == "rag-system" and p.get("API_Version") else 1)' \
+                "$health_file"; then
                 healthy=1
                 break
               fi
             fi
+
             sleep 2
           done
 
           if [[ "$healthy" -ne 1 ]]; then
-            echo "::error::Docker smoke test failed: /api/v1/health did not return the expected API payload."
-            docker inspect "$container_name" --format 'Container status: {{.State.Status}}' 2>/dev/null || true
+            echo "::error::Docker smoke test failed: health endpoint did not return the expected API payload."
+
+            docker compose \
+              -p "$compose_project" \
+              -f "$compose_file" \
+              ps || true
+
+            docker compose \
+              -p "$compose_project" \
+              -f "$compose_file" \
+              logs --no-color --tail=80 api || true
+
             exit 1
           fi
 
-          echo "Docker smoke test passed: /api/v1/health returned the expected API name and version."
+          echo "Docker smoke test passed: API name and version verified."
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
