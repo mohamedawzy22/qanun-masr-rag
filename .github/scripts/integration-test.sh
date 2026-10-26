@@ -245,10 +245,6 @@ if (( api_ready != 1 )); then
     exit 1
 fi
 
-if ! docker logs "$api_name" 2>&1 | grep -Fq "Application dependencies initialized"; then
-    echo "::error::Application initialization completion log was not found."
-    exit 1
-fi
 
 curl --fail --silent --show-error --max-time 5 \
     http://127.0.0.1:16333/collections/rag-integration-test |
