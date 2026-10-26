@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish API Image to GHCR
+    name: Build, smoke-test, and publish API image to GHCR
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
@@ -40,6 +40,81 @@ jobs:
         run: |
           echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/qanun-masr-rag-api" >> "$GITHUB_OUTPUT"
 
+      - name: Build image locally without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          push: false
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ github.event.workflow_run.head_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the built API image
+        shell: bash
+        env:
+          ENV_APP: ${{ secrets.ENV_APP }}
+          IMAGE: ${{ steps.image.outputs.name }}:sha-${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ENV_APP:-}" ]]; then
+            echo "::error::Repository secret ENV_APP is missing."
+            exit 1
+          fi
+
+          env_file="$(mktemp)"
+          health_file="$(mktemp)"
+          container_name="rag-api-smoke-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+            rm -f "$env_file" "$health_file"
+          }
+          trap cleanup EXIT
+          chmod 600 "$env_file"
+          printf '%s\n' "$ENV_APP" > "$env_file"
+          unset ENV_APP
+
+          docker run --detach \
+            --name "$container_name" \
+            --env-file "$env_file" \
+            --publish 127.0.0.1:18001:8001 \
+            "$IMAGE" >/dev/null
+
+          healthy=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --max-time 3 \
+              http://127.0.0.1:18001/api/v1/health \
+              --output "$health_file" 2>/dev/null; then
+              if python - "$health_file" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text())
+          if payload.get("API_Name") != "rag-system" or not payload.get("API_Version"):
+              raise SystemExit(1)
+          PY
+              then
+                healthy=1
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [[ "$healthy" -ne 1 ]]; then
+            echo "::error::Docker smoke test failed: /api/v1/health did not return the expected API payload."
+            docker inspect "$container_name" --format 'Container status: {{.State.Status}}' 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Docker smoke test passed: /api/v1/health returned the expected API name and version."
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -47,14 +122,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          push: true
-          tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:sha-${{ github.event.workflow_run.head_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish the smoke-tested image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:sha-${COMMIT_SHA}"
+          docker push "${IMAGE}:latest"
